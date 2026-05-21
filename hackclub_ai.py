@@ -178,6 +178,7 @@ THINK_REPLY_GAP = BLANK        # line gap between thinking and the response
 THINK_TOOL_GAP = LINE          # smaller gap between thinking and tool status
 CONTENT_INDENT = 2
 DEFAULT_MODEL = os.getenv("HC_DEFAULT_MODEL", "~openai/gpt-mini-latest")
+FALLBACK_MODEL = os.getenv("HC_FALLBACK_MODEL", "deepseek/deepseek-v4-flash")
 THINK_INDENT = 4
 FOLLOW_MIN_S = 0.15
 STREAM_REDRAW_S = 0.12
@@ -2247,7 +2248,8 @@ class Shell:
                 self.refresh_status(invalidate=True)
         except Exception as e:
             self.err(str(e))
-    def stream_text(self, msgs):
+    def stream_text(self, msgs, model=None, _is_fallback=False):
+        active_model = model or self.model
         self._ensure_ui()
         out = ""
         think = ""
@@ -2255,7 +2257,8 @@ class Shell:
         out_i = None
         with self._frag_lock:
             spin_i = len(self.blocks)
-            self.blocks.append(UiBlock("spin", SPINNER[0] + " thinking", "class:dim"))
+            label = "thinking" if not _is_fallback else f"thinking (fallback: {active_model})"
+            self.blocks.append(UiBlock("spin", SPINNER[0] + " " + label, "class:dim"))
         self.follow_latest(force=True)
         stop = threading.Event()
         def spin():
@@ -2264,7 +2267,7 @@ class Shell:
                 with self._frag_lock:
                     if spin_i >= len(self.blocks) or self.blocks[spin_i].kind != "spin":
                         break
-                    self.blocks[spin_i] = UiBlock("spin", SPINNER[i % len(SPINNER)] + " thinking", "class:dim")
+                    self.blocks[spin_i] = UiBlock("spin", SPINNER[i % len(SPINNER)] + " " + label, "class:dim")
                 i += 1
         worker = threading.Thread(target=spin, daemon=True)
         worker.start()
@@ -2277,7 +2280,7 @@ class Shell:
                     self.blocks.pop(spin_i)
             spin_i = None
         try:
-            for chunk in self.client.chat.send(model=self.model, messages=msgs, stream=True):
+            for chunk in self.client.chat.send(model=active_model, messages=msgs, stream=True):
                 self.read_usage(chunk, invalidate=False)
                 for kind, piece in self.delta_parts(chunk):
                     if kind == "reasoning":
@@ -2317,13 +2320,29 @@ class Shell:
             with self._frag_lock:
                 if out_i is not None and out_i < len(self.blocks):
                     self.blocks.pop(out_i)
+                    out_i = None
                 if think_i is not None and think_i < len(self.blocks):
                     self.blocks.pop(think_i)
+                    think_i = None
+            reason = self._classify_error(e)
+            if not _is_fallback and active_model != FALLBACK_MODEL and FALLBACK_MODEL:
+                self.warn(f"primary model failed ({reason}: {str(e)[:160]}) — retrying with fallback {FALLBACK_MODEL}")
+                self.stream_i = None
+                return self.stream_text(msgs, model=FALLBACK_MODEL, _is_fallback=True)
             out = f"Request failed: {e}"
             self.err(out)
         finally:
             self.stream_i = None
         return out, think
+    def _classify_error(self, e):
+        s = str(e).lower()
+        if "429" in s or "rate" in s and "limit" in s: return "rate limited"
+        if "401" in s or "403" in s or "unauthorized" in s: return "auth error"
+        if "404" in s or "not found" in s: return "model not found"
+        if "timeout" in s or "timed out" in s: return "timeout"
+        if "5" in s[:4] and ("502" in s or "503" in s or "504" in s or "500" in s): return "upstream server error"
+        if "connection" in s or "network" in s: return "network error"
+        return "error"
     def _hide_mcp_json_block(self):
         with self._frag_lock:
             for i in range(len(self.blocks) - 1, -1, -1):

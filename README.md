@@ -228,6 +228,7 @@ Environment variables in the form `${NAME}` are expanded at load time.
 | `COMPOSIO_API_KEY` | no | — | Enables Composio MCP integrations |
 | `HACKCLUB_AI_BASE_URL` | no | `https://ai.hackclub.com/proxy/v1` | Override the API endpoint |
 | `HC_DEFAULT_MODEL` | no | `~openai/gpt-mini-latest` | Default model on launch |
+| `HC_FALLBACK_MODEL` | no | `deepseek/deepseek-v4-flash` | Used automatically if the primary model fails (rate limit, timeout, etc.). Set to an empty string to disable. |
 | `HC_MCP_CONFIG` | no | `~/mcp.json` | Path to MCP configuration file |
 | `HC_MCP_CACHE_TTL` | no | `300` | MCP tool list cache TTL (seconds) |
 | `HC_MAX_FILE` | no | `5000000` | Max size (bytes) for plain-text files in folder attachments |
