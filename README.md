@@ -230,6 +230,10 @@ Environment variables in the form `${NAME}` are expanded at load time.
 | `HC_DEFAULT_MODEL` | no | `~openai/gpt-mini-latest` | Default model on launch |
 | `HC_MCP_CONFIG` | no | `~/mcp.json` | Path to MCP configuration file |
 | `HC_MCP_CACHE_TTL` | no | `300` | MCP tool list cache TTL (seconds) |
+| `HC_MAX_FILE` | no | `5000000` | Max size (bytes) for plain-text files in folder attachments |
+| `HC_MAX_DOCX_FILE` | no | `30000000` | Max size (bytes) for `.docx` files (figures/images bloat file size; text content is much smaller) |
+| `HC_MAX_FILES` | no | `120` | Max files indexed per folder attachment |
+| `HC_MAX_CONTEXT` | no | `180000` | Max chars of file content included in context per attachment |
 
 ---
 

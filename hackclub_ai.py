@@ -29,7 +29,9 @@ COMPOSIO_KEY = "COMPOSIO_API_KEY"
 HOME = Path.home() / ".hackclub-ai-shell"
 CACHE_DIR = HOME / "cache"
 MCP_FILE = Path(os.getenv("HC_MCP_CONFIG", str(HOME / "mcp.json")))
-MAX_FILE = int(os.getenv("HC_MAX_FILE", "2000000"))
+MAX_FILE = int(os.getenv("HC_MAX_FILE", "5000000"))
+MAX_DOCX_FILE = int(os.getenv("HC_MAX_DOCX_FILE", "30000000"))
+INDEX_VERSION = "v2"
 MAX_CTX = int(os.getenv("HC_MAX_CONTEXT", "180000"))
 MAX_FILES = int(os.getenv("HC_MAX_FILES", "120"))
 MAX_TURNS = int(os.getenv("HC_MAX_TURNS", "20"))
@@ -822,10 +824,11 @@ class Indexer:
         path = Path(raw).expanduser().resolve()
         if not path.exists(): return None
         sig = self.sig_dir(path) if path.is_dir() else self.sig_file(path)
-        hit = self.cache.get("idx:" + sig)
+        key = f"idx:{INDEX_VERSION}:{sig}"
+        hit = self.cache.get(key)
         if hit: return Attachment(aid, hit["name"], hit["kind"], path, hit["content"], hit["chars"], hit["files"], True)
         att = self.dir(path, aid) if path.is_dir() else self.file(path, aid)
-        if att: self.cache.set("idx:" + sig, {"name": att.name, "kind": att.kind, "content": att.content, "chars": att.chars, "files": att.files})
+        if att: self.cache.set(key, {"name": att.name, "kind": att.kind, "content": att.content, "chars": att.chars, "files": att.files})
         return att
     def sig_file(self, path):
         s = path.stat(); return f"file:{path}:{s.st_size}:{int(s.st_mtime)}"
@@ -838,10 +841,17 @@ class Indexer:
                 if name in IGNORE_FILES or name.startswith("."): continue
                 p = Path(base) / name
                 try:
-                    if p.suffix.lower() in TEXT_EXT | {".docx"} and p.stat().st_size <= MAX_FILE:
+                    if self.is_readable(p):
                         s = p.stat(); h.update(f"{p.relative_to(root)}:{s.st_size}:{int(s.st_mtime)}".encode()); n += 1
                 except Exception: pass
         return h.hexdigest()
+    def is_readable(self, p):
+        ext = p.suffix.lower()
+        try: size = p.stat().st_size
+        except Exception: return False
+        if ext == ".docx": return size <= MAX_DOCX_FILE
+        if ext in TEXT_EXT: return size <= MAX_FILE
+        return False
     def file(self, path, aid):
         mime, _ = mimetypes.guess_type(str(path))
         if mime and mime.startswith("image/"):
@@ -880,18 +890,27 @@ class Indexer:
     def file_label(self, path):
         try:
             size = path.stat().st_size
+            ext = path.suffix.lower()
+            if ext == ".docx":
+                if size > MAX_DOCX_FILE:
+                    return f"{path.name}  [skipped: {size/1024/1024:.1f}MB > docx limit]"
+                return path.name
+            if ext not in TEXT_EXT:
+                return f"{path.name}  [skipped: unsupported type]"
             if size > MAX_FILE:
                 return f"{path.name}  [skipped: {size/1024/1024:.1f}MB > limit]"
-            if path.suffix.lower() not in TEXT_EXT | {".docx"}:
-                return f"{path.name}  [skipped: unsupported type]"
             return path.name
         except Exception:
             return path.name
     def text(self, path):
         try:
-            if path.stat().st_size > MAX_FILE: return None
-            if path.suffix.lower() not in TEXT_EXT | {".docx"}: return None
-            if path.suffix.lower() == ".docx": return self.docx(path)
+            ext = path.suffix.lower()
+            size = path.stat().st_size
+            if ext == ".docx":
+                if size > MAX_DOCX_FILE: return None
+                return self.docx(path)
+            if ext not in TEXT_EXT: return None
+            if size > MAX_FILE: return None
             return path.read_text("utf-8", errors="replace")
         except Exception:
             return None
@@ -1941,7 +1960,9 @@ class Shell:
                 return self.err(f"could not read file: {p.name} — unsupported type {ext}")
             try:
                 size = p.stat().st_size
-                if size > MAX_FILE:
+                if ext == ".docx" and size > MAX_DOCX_FILE:
+                    return self.err(f"could not read file: {p.name} — docx too large ({size/1024/1024:.1f}MB > {MAX_DOCX_FILE/1024/1024:.0f}MB limit, raise HC_MAX_DOCX_FILE to override)")
+                if ext != ".docx" and size > MAX_FILE:
                     return self.err(f"could not read file: {p.name} — too large ({size/1024/1024:.1f}MB > {MAX_FILE/1024/1024:.1f}MB limit, raise HC_MAX_FILE to override)")
             except Exception:
                 pass
