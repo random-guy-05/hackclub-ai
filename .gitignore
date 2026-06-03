@@ -4,9 +4,12 @@ __pycache__/
 *.pyd
 
 .venv/
+.venv-test/
+.venv-build/
+build/
+dist/
+assets/icon.iconset/
 venv/
-env/
-.hackclub_venv/
 
 .env
 .env.*

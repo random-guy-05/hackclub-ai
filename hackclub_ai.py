@@ -1,26 +1,9 @@
-import os, sys, re, json, time, base64, hashlib, mimetypes, zipfile, subprocess, threading, queue, urllib.request, urllib.error, shutil, asyncio
+import os, sys, re, json, time, base64, hashlib, mimetypes, zipfile, subprocess, threading, queue, urllib.request, urllib.error, shutil, argparse, uuid
 from pathlib import Path
 from dataclasses import dataclass
 import xml.etree.ElementTree as ET
-import questionary
-from prompt_toolkit.application import Application, run_in_terminal
-from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.document import Document
-from prompt_toolkit.completion import Completer, Completion
-from prompt_toolkit.filters import Condition, has_focus
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.layout import Layout, HSplit, VSplit, Window, ScrollablePane
-from prompt_toolkit.layout.containers import ConditionalContainer
-from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
-from prompt_toolkit.layout.dimension import Dimension
-from prompt_toolkit.key_binding.defaults import load_key_bindings
-from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
-from prompt_toolkit.key_binding.bindings.mouse import load_mouse_bindings
-from prompt_toolkit.keys import Keys
-from prompt_toolkit.mouse_events import MouseEventType
 from rich.console import Console
 from rich.markdown import Markdown
-from prompt_toolkit.styles import Style as PTStyle
 from openrouter import OpenRouter
 from openrouter.types import UNSET
 API_URL = os.getenv("HACKCLUB_AI_BASE_URL", "https://ai.hackclub.com/proxy/v1")
@@ -35,6 +18,12 @@ INDEX_VERSION = "v3"
 MAX_CTX = int(os.getenv("HC_MAX_CONTEXT", "180000"))
 MAX_FILES = int(os.getenv("HC_MAX_FILES", "400"))
 MAX_TURNS = int(os.getenv("HC_MAX_TURNS", "20"))
+# Long-context efficiency: cap the raw history sent per request to a char budget
+# (~chars/4 tokens), and fold older turns into a rolling summary once the live
+# context grows past a threshold so per-request input stays bounded.
+HISTORY_BUDGET = int(os.getenv("HC_HISTORY_BUDGET", str(MAX_CTX // 2)))
+AUTO_COMPACT_PCT = float(os.getenv("HC_AUTO_COMPACT_PCT", "75"))
+AUTO_COMPACT_KEEP = int(os.getenv("HC_AUTO_COMPACT_KEEP", "6"))
 CACHE_TTL = int(os.getenv("HC_CACHE_TTL", "86400"))
 MCP_TTL = int(os.getenv("HC_MCP_CACHE_TTL", "300"))
 CTX_WINDOW = int(os.getenv("HC_CONTEXT_WINDOW", "200000"))
@@ -56,62 +45,150 @@ MODELS = [
     ("Auto", "openrouter/auto"),
     ("Custom", "custom"),
 ]
-SKILLS = {
-    "fix": "Fix the bug. Start with root cause in 1-2 sentences, then show the minimal code change. No drive-by refactors.\n\n",
-    "ship": "Ship the smallest working solution first. List assumptions, give copy-pasteable code/commands, note what to verify after.\n\n",
-    "read": "Read the attached context (or what I describe) and explain: purpose, main files, data flow, and the riskiest parts. Be specific, cite paths.\n\n",
-    "plan": "Before coding: break this into numbered steps, call out blockers and unknowns, estimate what to do first vs later.\n\n",
-    "diff": "Reply with only the exact changes needed — unified diff or before/after snippets. No essay unless I ask.\n\n",
-    "grep": "Find where this lives in the codebase. List file paths, line-level clues, and the symbol/string to search for.\n\n",
-    "bash": "Give safe macOS/Linux commands. Flag destructive steps, show dry-run when possible, one command per line with a short why.\n\n",
-    "api": "Design or implement the API: method, path, auth, request/response JSON, status codes, and one example curl.\n\n",
-    "sql": "Write SQL that works. Include schema assumptions, explain the query plan in plain English, suggest an index if slow.\n\n",
-    "test": "Write focused tests for happy path, one edge case, and one failure case. Use the project's existing test style if visible.\n\n",
-    "review": "Code review: bugs, security, perf, naming, missing tests — ordered by severity. Skip nitpicks.\n\n",
-    "pr": "Write a PR: title, summary (3 bullets), test plan checklist, and risks/rollback notes.\n\n",
-    "regex": "Write the regex, explain capture groups, and give 3 match/non-match examples.\n\n",
-    "json": "Parse, transform, or validate the JSON/data I give. Output valid JSON and note schema edge cases.\n\n",
-    "quick": "Shortest correct answer. No preamble, no recap, no alternatives unless blocked.\n\n",
+REASONING_VARIANTS = {
+    "openai": [("low", "low"), ("medium", "medium"), ("high", "high"), ("xhigh", "xhigh")],
+    "deepseek": [("low", "low"), ("high", "high"), ("max", "xhigh")],
+    "anthropic": [("low", "low"), ("medium", "medium"), ("high", "high"), ("max", "xhigh")],
+    "google": [("minimal", "minimal"), ("low", "low"), ("medium", "medium"), ("high", "high")],
+    "generic": [("low", "low"), ("medium", "medium"), ("high", "high")],
 }
-COMMANDS = ["/help", "/model", "/clear", "/exit", "/attach", "/drop", "/context", "/skills", "/save", "/copy", "/export", "/system", "/mcp", "/cache", "/theme", "/compact"] + [f"/skill:{k}" for k in SKILLS]
+SKILLS = {
+    "build": "Implement the requested change end-to-end. Start with the smallest working version, preserve existing behavior unless asked otherwise, and state any assumptions that matter.\n\n",
+    "debug": "Debug this systematically. Start with the most likely root cause in 1-2 sentences, then show the smallest reliable fix and how to verify it. Avoid unrelated refactors.\n\n",
+    "explain": "Explain the code or behavior concretely. Cover purpose, key files/functions, data flow, and the main gotchas. Cite paths or symbols when useful.\n\n",
+    "refactor": "Refactor for clarity and maintainability without changing behavior. Prefer small mechanical changes, keep names honest, and avoid broad rewrites unless necessary.\n\n",
+    "test": "Add or propose focused tests that cover the happy path, one meaningful edge case, and one failure mode. Use the project's existing test style and avoid noisy low-value tests.\n\n",
+    "search": "Find where this lives in the codebase. Return the most relevant files, symbols, and search terms first, with a short note on why each result matters.\n\n",
+    "shell": "Give safe shell commands for macOS/Linux. Prefer copy-pasteable commands, note destructive steps, and include a quick explanation for each command.\n\n",
+    "api": "Design or implement the API carefully: method, path, auth, request/response schema, validation, status codes, and one concrete example.\n\n",
+    "docs": "Write clean developer-facing docs or README text. Be explicit, structured, and optimized for someone using the project for the first time.\n\n",
+    "sql": "Write SQL that works. State schema assumptions, explain the query plainly, and suggest an index or simplification if performance could matter.\n\n",
+    "pr": "Write a concise PR package: title, summary bullets, testing notes, risks, and rollout or rollback guidance if relevant.\n\n",
+    "quick": "Answer as briefly as possible while still being correct. No preamble, no recap, no alternatives unless needed.\n\n",
+}
+SKILL_ALIASES = {
+    "fix": "debug",
+    "ship": "build",
+    "read": "explain",
+    "grep": "search",
+    "bash": "shell",
+    "regex": "quick",
+    "json": "quick",
+}
+MODE_PROMPTS = {
+    "side": (
+        "\n\nSIDE MODE: This is a quick side question. Answer briefly and directly. "
+        "Do not assume it changes the main project task unless the user says so."
+    ),
+    "plan": (
+        "\n\nPLAN MODE: Do NOT write code or propose disk changes yet. "
+        "First produce a numbered execution plan with risks, unknowns, and verification steps. "
+        "Wait for explicit approval before implementation."
+    ),
+    "grill": (
+        "\n\nGRILL MODE: Stress-test the user's plan or design with relentless Socratic questioning. "
+        "Find weak assumptions, missing edge cases, failure modes, and alternatives. "
+        "Ask sharp follow-up questions before offering solutions."
+    ),
+}
+GOAL_KICKOFF = (
+    "Execute this goal now. Stay locked to this objective — do not drift. "
+    "Do not stop at partial progress, vague next steps, or suggestions. "
+    "Keep going until the goal is fully implemented and verified. "
+    "If blocked, state the blocker briefly and immediately take the smallest action to unblock it. "
+    "Write files with the fs JSON tool — put file content ONLY inside the JSON, never in chat prose. "
+    "Keep reasoning minimal; do not draft full files in thinking then repeat them in the reply. "
+    "Never tell the user to copy-paste code or save files manually."
+)
+EXECUTION_RULES = (
+    "\n\nEXECUTION RULES:\n"
+    "- Reasoning is internal planning only: short bullets, no code, no full file drafts.\n"
+    "- Never duplicate content — if you thought it, do not paste it again in the visible reply.\n"
+    "- To create/edit local files: reply with ONLY fs JSON (see LOCAL FILESYSTEM ACCESS). "
+    "Put the entire file body in the JSON content field — not in markdown fences or prose.\n"
+    "- After a successful fs write: confirm briefly (1-2 sentences). Do not re-print the file.\n"
+    "- When building something: act first (fs tool), explain second.\n"
+)
+REVIEW_PROMPT = (
+    "Perform a full review using the attached context. "
+    "Analyze the project tree for bugs, safety anti-patterns, missing tests, architectural risks, and technical debt. "
+    "Order findings by severity. Cite concrete file paths. Skip style nitpicks.\n\n"
+)
+GRILL_KICKOFF = (
+    "GRILL ME — inspect this session for any existing plan, design, or proposed approach.\n"
+    "If you find a concrete plan in the conversation or attached context, immediately start stress-testing it "
+    "with relentless Socratic questioning. Challenge assumptions, expose edge cases, failure modes, and missing steps. "
+    "Ask the hardest questions first. Do not soften or validate — grill it.\n"
+    "If there is NO clear plan yet, say explicitly that there is no plan to grill, and tell the user what "
+    "minimum plan or design decision you would need before grilling can begin.\n"
+    "Do not jump into implementation unless it helps expose a flaw in the plan."
+)
+YEET_COMMIT_FALLBACK = "chore: automated commit via HackClub CLI"
+AGENTS_MD_TEMPLATE = """# AGENTS.md
+
+## Project
+Describe what this repository does in 2-4 sentences.
+
+## Working rules
+- Prefer minimal, focused changes.
+- Match existing conventions in this repo.
+- Explain risky changes before making them.
+- Do not commit secrets, credentials, or local-only files.
+
+## Repository layout
+- `src/` — main application code
+- `tests/` — automated tests
+- `docs/` — documentation
+
+## Commands
+- install: `pip install -r requirements.txt`
+- test: `pytest`
+- run: `python -m app`
+
+## Context notes
+Add project-specific constraints, APIs, deployment notes, and gotchas here.
+"""
+CORE_COMMANDS = [
+    "/help", "/model", "/clear", "/exit", "/attach", "/drop", "/context", "/skills",
+    "/save", "/copy", "/export", "/system", "/mcp", "/cache", "/theme", "/compact", "/side",
+    "/plan", "/goal", "/diff", "/init", "/review", "/grill-me", "/yeet", "/sessions", "/rename",
+]
+COMMANDS = CORE_COMMANDS + [f"/{k}" for k in SKILLS]
 CMD_SET = set(COMMANDS)
 SLASH_MENU_LINES = 8
 CMD_DESCRIPTIONS = {
     "/help": "List all commands",
-    "/model": "Switch model (Tab to pick)",
+    "/model": "Switch model and reasoning level",
     "/attach": "Attach file or folder via Finder",
     "/drop": "Remove attachment(s)",
     "/context": "List attached files and folders",
-    "/skills": "List skill shortcuts",
-    "/skill:fix": "Fix a bug — root cause + minimal patch",
-    "/skill:ship": "Ship the smallest working solution",
-    "/skill:read": "Explain codebase structure and flow",
-    "/skill:plan": "Break work into numbered steps",
-    "/skill:diff": "Show only the exact code changes",
-    "/skill:grep": "Find where something lives in the repo",
-    "/skill:bash": "Safe shell commands with explanations",
-    "/skill:api": "Design or implement an API endpoint",
-    "/skill:sql": "Write and explain SQL queries",
-    "/skill:test": "Focused tests for happy and edge cases",
-    "/skill:review": "Code review ordered by severity",
-    "/skill:pr": "Write a pull request description",
-    "/skill:regex": "Regex with examples",
-    "/skill:json": "Parse, transform, or validate JSON",
-    "/skill:quick": "Shortest correct answer",
+    "/skills": "List built-in prompt shortcuts",
     "/save": "Save last reply to a file",
     "/copy": "Copy last reply to clipboard",
     "/export": "Download chat as markdown or json",
     "/system": "View or set the system prompt",
     "/mcp": "List connected MCP tools",
-    "/cache": "Cache stats, list workspaces, or clear",
+    "/cache": "Cache stats, list cached folders, or clear",
     "/theme": "Switch dark or light theme",
-    "/compact": "Toggle compact UI and context",
+    "/compact": "Summarize transcript and replace chat context",
+    "/side": "Ask a side question without polluting main history",
+    "/plan": "Toggle planning mode (plan before code changes)",
+    "/goal": "Start relentless execution mode for an objective",
+    "/diff": "Show live git diff in the terminal",
+    "/init": "Scaffold AGENTS.md in an attached folder or home",
+    "/review": "Run a full project review from attachments",
+    "/grill-me": "Immediately stress-test the current plan",
+    "/yeet": "Stage, commit, push, and open a GitHub PR",
+    "/sessions": "List saved chat sessions",
+    "/rename": "Rename the current chat",
     "/clear": "Clear chat history",
     "/exit": "Quit HackClub CLI",
 }
 for _sk in SKILLS:
-    CMD_DESCRIPTIONS.setdefault(f"/skill:{_sk}", SKILLS[_sk].split(".")[0].strip())
+    CMD_DESCRIPTIONS.setdefault(f"/{_sk}", SKILLS[_sk].split(".")[0].strip())
 PREFS_FILE = HOME / "prefs.json"
+CONFIG_FILE = HOME / "config.json"
+SESSIONS_DIR = HOME / "sessions"
 THEMES = {
     "dark": {
         "prompt": "#6ac6ff bold",
@@ -129,7 +206,11 @@ THEMES = {
     },
 }
 SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-BANNER = "HackClub CLI"
+# Smooth pulsing braille bar for the "working" indicator and a 3-state dot cycle
+# used to animate the status label (e.g. "Thinking" → "Thinking ·" → "Thinking ··").
+SPINNER_BAR = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "▆", "▅", "▄", "▃", "▂"]
+SPINNER_DOTS = ["", " ·", " · ·", " · · ·"]
+BANNER = "HackClub AI"
 CYAN = "\033[96m"
 BLUE = "\033[94m"
 DIM = "\033[2m"
@@ -176,18 +257,97 @@ RULE_GAP = LINE                # small gap after ─── divider, before You
 HEADER_GAP = BLANK             # slight gap after You / Assistant / thinking headers
 THINK_REPLY_GAP = BLANK        # line gap between thinking and the response
 THINK_TOOL_GAP = LINE          # smaller gap between thinking and tool status
+NOTIFY_USER_GAP = LINE         # gap between a status notify and the next user divider
 CONTENT_INDENT = 2
 DEFAULT_MODEL = os.getenv("HC_DEFAULT_MODEL", "~openai/gpt-mini-latest")
 FALLBACK_MODEL = os.getenv("HC_FALLBACK_MODEL", "deepseek/deepseek-v4-flash")
 THINK_INDENT = 4
 FOLLOW_MIN_S = 0.15
-STREAM_REDRAW_S = 0.12
+STREAM_REDRAW_S = 0.22
 
 def load_prefs():
     try:
         return json.loads(PREFS_FILE.read_text())
     except Exception:
         return {}
+
+def load_api_key():
+    try:
+        if CONFIG_FILE.exists():
+            data = json.loads(CONFIG_FILE.read_text())
+            key = (data.get("hackclub_api_key") or data.get("api_key") or "").strip()
+            if key:
+                os.environ[API_KEY] = key
+                return key
+    except Exception:
+        pass
+    key = os.getenv(API_KEY, "").strip()
+    if key:
+        return key
+    try:
+        prefs = load_prefs()
+        key = (prefs.get("hackclub_api_key") or prefs.get("api_key") or "").strip()
+        if key:
+            os.environ[API_KEY] = key
+            return key
+    except Exception:
+        pass
+    return ""
+
+def load_composio_key():
+    try:
+        if CONFIG_FILE.exists():
+            data = json.loads(CONFIG_FILE.read_text())
+            key = (data.get("composio_api_key") or "").strip()
+            if key:
+                os.environ[COMPOSIO_KEY] = key
+                return key
+    except Exception:
+        pass
+    key = os.getenv(COMPOSIO_KEY, "").strip()
+    if key:
+        return key
+    return ""
+
+def save_composio_key(key):
+    key = (key or "").strip()
+    HOME.mkdir(parents=True, exist_ok=True)
+    data = {}
+    try:
+        if CONFIG_FILE.exists():
+            data = json.loads(CONFIG_FILE.read_text())
+    except Exception:
+        data = {}
+    if key:
+        data["composio_api_key"] = key
+        os.environ[COMPOSIO_KEY] = key
+    elif "composio_api_key" in data:
+        del data["composio_api_key"]
+        os.environ.pop(COMPOSIO_KEY, None)
+    write_json_atomic(CONFIG_FILE, data)
+
+def save_api_key(key):
+    key = (key or "").strip()
+    if not key:
+        return
+    os.environ[API_KEY] = key
+    HOME.mkdir(parents=True, exist_ok=True)
+    data = {}
+    try:
+        if CONFIG_FILE.exists():
+            data = json.loads(CONFIG_FILE.read_text())
+    except Exception:
+        data = {}
+    data["hackclub_api_key"] = key
+    write_json_atomic(CONFIG_FILE, data)
+
+def mask_secret(value, show=4):
+    value = (value or "").strip()
+    if not value:
+        return "(not set)"
+    if len(value) <= show + 3:
+        return "•" * len(value)
+    return value[:show] + "…" + value[-3:]
 
 def save_prefs(data):
     try:
@@ -197,8 +357,279 @@ def save_prefs(data):
     except Exception:
         pass
 
+def make_session_id():
+    return time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+
+def session_title_from_history(history):
+    for m in history:
+        if m.get("role") == "user":
+            text = message_text(m.get("content", "")).strip()
+            if text:
+                text = re.sub(r"\s+", " ", text)
+                return text[:80] + ("..." if len(text) > 80 else "")
+    return "Untitled session"
+
+def session_display_title(history=None, custom_title=None, data=None):
+    if data is not None:
+        custom = (data.get("custom_title") or "").strip()
+        if custom:
+            return custom
+        return session_title_from_history(data.get("history") or [])
+    custom = (custom_title or "").strip()
+    if custom:
+        return custom
+    return session_title_from_history(history or [])
+
+def rename_saved_session(session_id, title):
+    if not session_id:
+        return False
+    path = SESSIONS_DIR / f"{session_id}.json"
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    title = (title or "").strip()
+    data["custom_title"] = title or None
+    data["title"] = title or session_title_from_history(data.get("history") or [])
+    write_json_atomic(path, data)
+    return True
+
+def write_json_atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+def delete_all_sessions():
+    count = 0
+    if not SESSIONS_DIR.exists():
+        return 0
+    for path in SESSIONS_DIR.glob("*.json"):
+        try:
+            path.unlink()
+            count += 1
+        except Exception:
+            continue
+    return count
+
+
+def list_saved_sessions():
+    if not SESSIONS_DIR.exists():
+        return []
+    out = []
+    for path in SESSIONS_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data.setdefault("id", path.stem)
+            data.setdefault("updated_at", path.stat().st_mtime)
+            out.append(data)
+        except Exception:
+            continue
+    out.sort(key=session_epoch, reverse=True)
+    return out
+
+
+def session_epoch(data):
+    v = data.get("updated_at", 0)
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return time.mktime(time.strptime(str(v)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return 0.0
+
+def format_session_line(data, index=None):
+    sid = data.get("id", "?")
+    title = data.get("title") or session_display_title(data=data)
+    turns = len(data.get("history", [])) // 2
+    updated = data.get("updated_at", "")
+    if isinstance(updated, (int, float)):
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(updated))
+    else:
+        when = str(updated)[:16].replace("T", " ")
+    prefix = f"{index:2}. " if index is not None else ""
+    return f"{prefix}{when}  {title}  ({turns} turns)  [{sid}]"
+
+def pick_saved_session(session_id=None):
+    sessions = list_saved_sessions()
+    if not sessions:
+        return None
+    if not session_id:
+        return None
+    matches = [s for s in sessions if s["id"] == session_id or s["id"].startswith(session_id)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+def parse_cli_args(argv):
+    parser = argparse.ArgumentParser(prog="hackclub", add_help=True)
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="ID",
+        help="resume a saved session (optionally by id prefix)",
+    )
+    parser.add_argument(
+        "prompt",
+        nargs=argparse.REMAINDER,
+        help="optional first message to send after startup",
+    )
+    args = parser.parse_args(argv)
+    prompt_parts = list(args.prompt)
+    resume = args.resume
+    if resume is not None and str(resume).startswith("/"):
+        prompt_parts.insert(0, resume)
+        resume = None
+    prompt = " ".join(prompt_parts).strip()
+    if prompt == "--":
+        prompt = ""
+    return {"resume": resume, "prompt": prompt}
+
 def default_model():
     return load_prefs().get("model") or DEFAULT_MODEL
+
+def model_family(model):
+    m = (model or "").lower()
+    if "openai/" in m:
+        return "openai"
+    if "deepseek/" in m:
+        return "deepseek"
+    if "anthropic/" in m or "claude" in m:
+        return "anthropic"
+    if "google/" in m or "gemini" in m:
+        return "google"
+    return "generic"
+
+def reasoning_variants_for_model(model):
+    return REASONING_VARIANTS.get(model_family(model), REASONING_VARIANTS["generic"])
+
+def default_reasoning_for_model(model):
+    fam = model_family(model)
+    if fam == "deepseek":
+        return "medium"
+    return "medium"
+
+def normalize_reasoning_for_model(model, value=None):
+    if not value:
+        return default_reasoning_for_model(model)
+    low = str(value).strip().lower()
+    choices = reasoning_variants_for_model(model)
+    for label, effort in choices:
+        if low in {label.lower(), effort.lower()}:
+            return effort
+    return default_reasoning_for_model(model)
+
+def reasoning_label_for_model(model, value=None):
+    effort = normalize_reasoning_for_model(model, value)
+    for label, canonical in reasoning_variants_for_model(model):
+        if canonical == effort:
+            return label
+    return effort
+
+def resolve_model_query(text, allow_partial=False):
+    q = (text or "").strip()
+    if not q:
+        return None
+    if q.isdigit():
+        idx = int(q) - 1
+        if 0 <= idx < len(MODELS):
+            return MODELS[idx][1]
+    ql = q.lower()
+    for name, mid in MODELS:
+        if ql == mid.lower() or ql == name.lower():
+            return mid
+    if allow_partial:
+        for name, mid in MODELS:
+            if ql in name.lower() or ql in mid.lower():
+                return mid
+    if "/" in q or q.startswith("~"):
+        return q
+    return None
+
+def parse_model_command(q):
+    q = (q or "").strip()
+    if not q:
+        return {"kind": "list", "filter": ""}
+    if q.lower() == "custom" or q.lower().startswith("custom "):
+        tail = q[6:].strip() if q.lower().startswith("custom ") else ""
+        if not tail:
+            return {"kind": "custom_id", "model_id": None, "variant_q": ""}
+        tokens = tail.split()
+        model_id = tokens[0]
+        variant_q = " ".join(tokens[1:]).lower()
+        if "/" in model_id or model_id.startswith("~"):
+            return {"kind": "variants", "model_id": model_id, "display": model_id, "variant_q": variant_q, "custom": True}
+        return {"kind": "custom_id", "model_id": model_id, "variant_q": variant_q}
+    mid, name, rest = split_model_query(q)
+    if mid and mid != "custom":
+        return {"kind": "variants", "model_id": mid, "display": name, "variant_q": rest.lower(), "custom": False}
+    first = q.split()[0]
+    if "/" in first or first.startswith("~"):
+        tokens = q.split()
+        return {"kind": "variants", "model_id": tokens[0], "display": tokens[0], "variant_q": " ".join(tokens[1:]).lower(), "custom": False}
+    return {"kind": "list", "filter": q.lower()}
+
+def model_command_insert(model_id, display, label, custom=False):
+    if custom:
+        return f"/model custom {model_id} {label}"
+    return f"/model {display} {label}"
+
+def split_model_query(text):
+    q = (text or "").strip()
+    if not q:
+        return None, None, ""
+    if q.isdigit():
+        idx = int(q) - 1
+        if 0 <= idx < len(MODELS):
+            name, mid = MODELS[idx]
+            return mid, name, ""
+    candidates = []
+    for name, mid in MODELS:
+        candidates.append((name, mid, name))
+        candidates.append((mid, mid, name))
+    candidates.sort(key=lambda item: len(item[0]), reverse=True)
+    ql = q.lower()
+    for token, mid, name in candidates:
+        tl = token.lower()
+        if ql == tl:
+            return mid, name, ""
+        if ql.startswith(tl + " "):
+            return mid, name, q[len(token):].strip()
+    return None, None, q
+
+def run_cmd(args, cwd=None, timeout=120):
+    try:
+        p = subprocess.run(
+            args,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return p.returncode, (p.stdout or ""), (p.stderr or "")
+    except FileNotFoundError:
+        return 127, "", f"command not found: {args[0]}"
+    except Exception as e:
+        return 1, "", str(e)
+
+def git_root(start=None):
+    start = Path(start or Path.cwd()).expanduser()
+    try:
+        start = start.resolve()
+    except Exception:
+        pass
+    code, out, _ = run_cmd(["git", "-C", str(start), "rev-parse", "--show-toplevel"])
+    if code == 0 and out.strip():
+        return Path(out.strip())
+    cur = start if start.is_dir() else start.parent
+    for p in [cur, *cur.parents]:
+        if (p / ".git").exists():
+            return p
+    return cur
 
 def copy_to_clipboard(text):
     text = text or ""
@@ -269,29 +700,6 @@ def message_text(content):
         return "\n".join(p for p in parts if p)
     return str(content)
 
-def ask_attach_kind():
-    try:
-        val = questionary.select(
-            "Attach file or folder?",
-            choices=[
-                questionary.Choice("File", "file"),
-                questionary.Choice("Folder", "folder"),
-            ],
-            style=STYLE,
-        ).ask()
-        return val
-    except Exception:
-        try:
-            choice = input("Attach [f]ile or [d]irectory? ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return None
-        if choice in {"f", "file"}:
-            return "file"
-        if choice in {"d", "dir", "directory", "folder"}:
-            return "folder"
-        return None
-
 def pick_macos_path(kind):
     script = (
         'POSIX path of (choose folder with prompt "Attach folder")'
@@ -307,248 +715,7 @@ def pick_macos_path(kind):
     return None
 
 def pick_path_for_kind(kind):
-    if sys.platform == "darwin":
-        return pick_macos_path(kind)
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        if kind == "folder":
-            path = filedialog.askdirectory(title="Attach folder")
-        else:
-            path = filedialog.askopenfilename(title="Attach file")
-        root.destroy()
-        return path or None
-    except Exception:
-        pass
-    try:
-        label = "folder" if kind == "folder" else "file"
-        return input(f"Path to {label}: ").strip() or None
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return None
-
-def pick_workspace_folder():
-    return pick_macos_path("folder") if sys.platform == "darwin" else pick_path_for_kind("folder")
-
-def leave_startup_screen():
-    sys.stdout.write("\033[?25h\033[?1049l\033[2J\033[H\033[3J")
-    sys.stdout.flush()
-
-def play_startup_animation():
-    import random
-    sys.stdout.write("\033[?1049h\033[2J\033[H\033[?25l")
-    sys.stdout.flush()
-    print()
-    shown = []
-    for line in LOGO:
-        shown.append(line)
-        sys.stdout.write("\033[2J\033[H\n")
-        for prev in shown:
-            print(f"{CYAN}{prev}{RST}")
-        sys.stdout.flush()
-        time.sleep(0.07)
-    print()
-    time.sleep(0.12)
-    for _ in range(4):
-        sys.stdout.write("\033[2J\033[H\n")
-        for line in shown:
-            if not line:
-                print()
-                continue
-            chars = list(line)
-            for _ in range(max(1, len(chars) // 16)):
-                i = random.randrange(len(chars))
-                if chars[i] not in LOGO_PROTECT:
-                    chars[i] = random.choice(GLITCH)
-            print(f"{CYAN}{''.join(chars)}{RST}")
-        print()
-        sys.stdout.flush()
-        time.sleep(0.045)
-    sys.stdout.write("\033[2J\033[H\n")
-    for line in shown:
-        print(f"{CYAN}{line}{RST}")
-    print()
-    width = 34
-    for i in range(28):
-        filled = max(1, int(width * (i + 1) / 28))
-        bar = "▰" * filled + "▱" * (width - filled)
-        pct = int(100 * (i + 1) / 28)
-        sys.stdout.write(f"\r  {CYAN}{SPINNER[i % len(SPINNER)]}{RST}  {DIM}boot{RST}  {BLUE}[{bar}]{RST}  {pct:3d}%")
-        sys.stdout.flush()
-        time.sleep(0.032)
-    sys.stdout.write(f"\r  {CYAN}◆{RST}  {BOLD}ready{RST}  {BLUE}[{'▰' * width}]{RST}  100%\n\n")
-    sys.stdout.write("\033[?25h")
-    sys.stdout.flush()
-
-def ask_startup_mode():
-    try:
-        val = questionary.select(
-            "Where do you want to work?",
-            choices=[
-                questionary.Choice("Workspace  — open a project folder", "workspace"),
-                questionary.Choice("Playground — start without attachments", "playground"),
-            ],
-            style=STYLE,
-        ).ask()
-        return val or "playground"
-    except Exception:
-        try:
-            choice = input("Workspace [w] or Playground [p]? ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return "playground"
-        if choice in {"w", "workspace", "folder", "dir"}:
-            return "workspace"
-        return "playground"
-
-def run_startup(shell):
-    try:
-        play_startup_animation()
-        mode = ask_startup_mode()
-        shell.mode = mode
-        if mode != "workspace":
-            return
-        print("  Choose your project folder in Finder...\n")
-        path = pick_workspace_folder()
-        if path:
-            shell.workspace_name = Path(path).name
-            shell.attach(path)
-        else:
-            shell.mode = "playground"
-            print("  No folder selected — starting in playground.\n")
-            time.sleep(0.6)
-    finally:
-        leave_startup_screen()
-
-def terminal_model_picker(current_label):
-    print("\nModels — number, name, or id (Enter to cancel):\n")
-    for i, (n, _) in enumerate(MODELS, 1):
-        mark = " *" if n == current_label else ""
-        print(f"  {i:2}. {n}{mark}")
-    print(f"\nCurrent: {current_label}")
-    try:
-        choice = input("> ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return None
-    if not choice:
-        return None
-    if choice.isdigit():
-        idx = int(choice) - 1
-        if 0 <= idx < len(MODELS):
-            mid = MODELS[idx][1]
-            if mid == "custom":
-                try:
-                    mid = input("Model ID: ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    return None
-                return mid or None
-            return mid
-    low = choice.lower()
-    for n, mid in MODELS:
-        if low == mid.lower() or low in n.lower():
-            if mid == "custom":
-                try:
-                    mid = input("Model ID: ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    return None
-                return mid or None
-            return mid
-    return choice
-
-def questionary_model_picker(current_label):
-    try:
-        val = questionary.select(
-            "Select model (↑↓ move, Enter select)",
-            choices=[questionary.Choice(f"{n:<22} {m}", m) for n, m in MODELS],
-            style=STYLE,
-            use_shortcuts=True,
-        ).ask()
-    except Exception:
-        return terminal_model_picker(current_label)
-    if not val:
-        return None
-    if val == "custom":
-        try:
-            custom = questionary.text("OpenRouter model ID:", style=STYLE).ask()
-        except Exception:
-            custom = None
-        return custom or None
-    return val
-
-def pt_style(name):
-    if name == "light":
-        return PTStyle.from_dict({
-            "prompt": "#0066cc bold bg:#e8e8e8",
-            "input_row": "bg:#e8e8e8",
-            "status": "#000000",
-            "text": "#111111",
-            "label": "bold #000000",
-            "dim": "#555555",
-            "ok": "#0066cc",
-            "warn": "#996600",
-            "error": "#cc0000",
-            "md_strong": "bold #111111",
-            "md_em": "italic #111111",
-            "md_h": "bold underline #0066cc",
-            "code": "#006600 bg:#eeeeee",
-            "think": "#888888",
-            "think_label": "#666666 bold",
-            "think_strong": "bold #777777",
-            "think_em": "italic #888888",
-            "think_h": "bold underline #777777",
-            "think_code": "#888888 bg:#eeeeee",
-            "sep": "#cccccc",
-            "user_label": "bold #0066cc",
-            "user_msg": "#222222",
-            "asst_label": "bold #006600",
-            "attach": "bold #006600",
-            "slash_sel": "bold #000000",
-            "slash_cmd": "#333333",
-            "slash_desc": "#666666",
-            "slash_sel_desc": "bold #444444",
-            "scrollbar.background": "#eeeeee",
-            "scrollbar.button": "#bbbbbb",
-            "scrollbar.arrow": "#666666",
-        })
-    return PTStyle.from_dict({
-        "prompt": "#6ac6ff bold bg:#2a2a2a",
-        "input_row": "bg:#2a2a2a",
-        "status": "#ffffff",
-        "text": "#e4e4e4",
-        "label": "bold #ffffff",
-        "dim": "#888888",
-        "ok": "#6ac6ff",
-        "warn": "#e5a045",
-        "error": "#ff6b6b",
-        "md_strong": "bold #e4e4e4",
-        "md_em": "italic #cccccc",
-        "md_h": "bold underline #6ac6ff",
-        "code": "#a8e6a8 bg:#1a1a1a",
-        "think": "#666666",
-        "think_label": "#555555 bold",
-        "think_strong": "bold #777777",
-        "think_em": "italic #666666",
-        "think_h": "bold underline #777777",
-        "think_code": "#888888 bg:#1a1a1a",
-        "sep": "#444444",
-        "user_label": "bold #6ac6ff",
-        "user_msg": "#cccccc",
-        "asst_label": "bold #a8e6a8",
-        "attach": "bold #a8e6a8",
-        "slash_sel": "bold #ffffff",
-        "slash_cmd": "#cccccc",
-        "slash_desc": "#888888",
-        "slash_sel_desc": "bold #aaaaaa",
-        "scrollbar.background": "#2a2a2a",
-        "scrollbar.button": "#555555",
-        "scrollbar.arrow": "#888888",
-    })
+    return pick_macos_path(kind)
 
 def rich_style_to_pt(style, tone="normal"):
     if not style:
@@ -624,169 +791,6 @@ def normalize_input(raw):
             return f"{token} {rest}".strip() if rest else token
     return raw
 
-STYLE = questionary.Style([("qmark", "fg:cyan bold"), ("question", "bold"), ("pointer", "fg:cyan bold"), ("highlighted", "fg:cyan bold"), ("instruction", "fg:gray italic")])
-
-IGNORE_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", ".pytest_cache", "build", "dist", ".next", ".idea", ".vscode"}
-IGNORE_FILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "uv.lock", ".DS_Store"}
-TEXT_EXT = {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".xml", ".sh", ".zsh", ".bash", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".sql", ".php", ".rb", ".swift", ".kt", ".vue", ".svelte", ".env"}
-
-class Slash(Completer):
-    def get_completions(self, doc, event):
-        line = doc.text_before_cursor
-        if not line and doc.text.startswith("/"):
-            line = doc.text
-        m = re.search(r"(/\S*)$", line)
-        if not m:
-            return
-        frag = m.group(1).lower()
-        if " " in frag:
-            return
-        for cmd in sorted(COMMANDS):
-            if cmd.startswith(frag):
-                yield Completion(cmd, start_position=-len(frag), display=cmd)
-
-def slash_menu_key_bindings(shell):
-    kb = KeyBindings()
-    menu_open = Condition(lambda: shell.slash_menu_open())
-
-    @kb.add("up", filter=menu_open)
-    @kb.add("c-p", filter=menu_open)
-    def _slash_up(event):
-        shell.slash_menu_index = max(0, shell.slash_menu_index - 1)
-        event.app.invalidate()
-
-    @kb.add("down", filter=menu_open)
-    @kb.add("c-n", filter=menu_open)
-    def _slash_down(event):
-        matches = shell.slash_matches()
-        if matches:
-            shell.slash_menu_index = min(len(matches) - 1, shell.slash_menu_index + 1)
-        event.app.invalidate()
-
-    @kb.add("tab", filter=menu_open)
-    def _slash_tab(event):
-        shell.apply_slash_selection(trailing_space=True)
-
-    @kb.add("s-tab", filter=menu_open)
-    def _slash_shift_tab(event):
-        matches = shell.slash_matches()
-        if matches:
-            shell.slash_menu_index = (shell.slash_menu_index - 1) % len(matches)
-        event.app.invalidate()
-
-    @kb.add("enter", filter=menu_open, eager=True)
-    def _slash_enter(event):
-        shell.apply_slash_selection(trailing_space=True)
-
-    return kb
-
-def input_key_bindings(shell):
-    kb = KeyBindings()
-    input_focus = has_focus(shell.input_control)
-    menu_open = Condition(lambda: shell.slash_menu_open())
-
-    @kb.add("enter", filter=input_focus & ~menu_open, eager=True)
-    def _input_send(event):
-        event.current_buffer.validate_and_handle()
-
-    @kb.add("c-j", filter=input_focus, eager=True)
-    def _input_newline(event):
-        event.current_buffer.newline()
-
-    return kb
-
-class ChatScrollPane(ScrollablePane):
-    def __init__(self, shell, content):
-        super().__init__(
-            content,
-            show_scrollbar=True,
-            height=Dimension(weight=1),
-            keep_cursor_visible=False,
-            keep_focused_window_visible=False,
-        )
-        self.shell = shell
-        self._max_scroll = 0
-        self.visible_height = 24
-
-    def _make_window_visible(self, visible_height, content_height, visible_win_write_pos, cursor_position=None):
-        if getattr(self.shell, "_keep_at_top", False):
-            self.vertical_scroll = 0
-            return
-        super()._make_window_visible(visible_height, content_height, visible_win_write_pos, cursor_position)
-
-    def write_to_screen(self, screen, mouse_handlers, write_position, parent_style, erase_bg, z_index):
-        keep_top = getattr(self.shell, "_keep_at_top", False)
-        if keep_top:
-            self.vertical_scroll = 0
-        elif self.shell.follow_output:
-            self._refresh_scroll_metrics(write_position)
-            self.vertical_scroll = self._max_scroll
-
-        super().write_to_screen(screen, mouse_handlers, write_position, parent_style, erase_bg, z_index)
-
-        self._refresh_scroll_metrics(write_position)
-        if self.vertical_scroll > self._max_scroll:
-            self.vertical_scroll = self._max_scroll
-        self._bind_scroll_wheel(mouse_handlers, write_position, self.show_scrollbar())
-
-    def _refresh_scroll_metrics(self, write_position):
-        show_sb = self.show_scrollbar()
-        virtual_width = write_position.width - (1 if show_sb else 0)
-        virtual_height = self.content.preferred_height(virtual_width, self.max_available_height).preferred
-        virtual_height = max(virtual_height, write_position.height)
-        self._max_scroll = max(0, virtual_height - write_position.height)
-        self.visible_height = write_position.height
-        if self.vertical_scroll > self._max_scroll:
-            self.vertical_scroll = self._max_scroll
-
-    def _bind_scroll_wheel(self, mouse_handlers, write_position, show_sb):
-        shell = self.shell
-
-        def on_wheel(event):
-            if event.event_type == MouseEventType.SCROLL_UP:
-                shell.scroll_output(-3)
-            elif event.event_type == MouseEventType.SCROLL_DOWN:
-                shell.scroll_output(3)
-
-        x_end = write_position.xpos + write_position.width - (1 if show_sb else 0)
-        for y in range(write_position.ypos, write_position.ypos + write_position.height):
-            row = mouse_handlers.mouse_handlers[y]
-            for x in range(write_position.xpos, x_end):
-                row[x] = on_wheel
-
-def output_key_bindings(shell):
-    kb = KeyBindings()
-
-    @kb.add("pageup")
-    def _page_up(event):
-        shell.scroll_output(-max(1, shell.output_pane.visible_height - 2))
-
-    @kb.add("pagedown")
-    def _page_down(event):
-        shell.scroll_output(max(1, shell.output_pane.visible_height - 2))
-
-    @kb.add("c-up")
-    def _line_up(event):
-        shell.scroll_output(-1)
-
-    @kb.add("c-down")
-    def _line_down(event):
-        shell.scroll_output(1)
-
-    @kb.add("c-g")
-    def _jump_bottom(event):
-        shell.follow_latest(force=True)
-
-    @kb.add(Keys.ScrollUp)
-    def _wheel_up(event):
-        shell.scroll_output(-3)
-
-    @kb.add(Keys.ScrollDown)
-    def _wheel_down(event):
-        shell.scroll_output(3)
-
-    return kb
-
 @dataclass
 class UiBlock:
     kind: str
@@ -836,7 +840,7 @@ class Cache:
     def clear(self):
         for p in CACHE_DIR.glob("*.json"): p.unlink(missing_ok=True)
     def stats(self): return len(list(CACHE_DIR.glob("*.json"))), sum(p.stat().st_size for p in CACHE_DIR.glob("*.json"))
-    def workspaces(self):
+    def cached_folders(self):
         out = []
         for p in sorted(CACHE_DIR.glob("*__*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
             try:
@@ -925,7 +929,7 @@ class Indexer:
                 not_loaded[rel_path] = f"{size/1024/1024:.1f}MB > {MAX_FILE/1024/1024:.0f}MB limit"
                 continue
             if count >= MAX_FILES:
-                not_loaded[rel_path] = "per-workspace file limit reached"
+                not_loaded[rel_path] = "per-folder file limit reached"
                 continue
             if total >= MAX_CTX:
                 not_loaded[rel_path] = "context budget filled"
@@ -963,14 +967,14 @@ class Indexer:
                 tree_lines.append(line)
         render("", 0)
         notice = (
-            f"Workspace dump — {count}/{len(all_files)} files loaded into context, "
+            f"Folder dump — {count}/{len(all_files)} files loaded into context, "
             f"{len(not_loaded)} listed in tree only. .docx files ARE parsed (text + tables); "
             f"if a .docx is marked [not loaded] the reason is shown next to it."
         )
-        header = ["### Workspace: " + root.name, notice, "```text", *tree_lines[:600], "```"]
+        header = ["### Folder: " + root.name, notice, "```text", *tree_lines[:600], "```"]
         body_parts = header + [loaded[k] for k in sorted(loaded.keys(), key=lambda x: x.lower())]
         body = "\n".join(body_parts)
-        return Attachment(aid, f"Workspace: {root.name}", "text", root, body, len(body), count)
+        return Attachment(aid, f"Folder: {root.name}", "text", root, body, len(body), count)
     def text(self, path):
         try:
             ext = path.suffix.lower()
@@ -1101,6 +1105,117 @@ def normalize_mcp_call(data):
     if not isinstance(args, dict):
         args = {}
     return {"tool": str(tool).strip(), "arguments": args}
+
+def normalize_fs_call(data):
+    if not isinstance(data, dict):
+        return None
+    if isinstance(data.get("fs"), dict):
+        data = data["fs"]
+    elif isinstance(data.get("write"), dict):
+        data = {"action": "write", **data["write"]}
+    elif data.get("path") and "content" in data and not data.get("tool"):
+        data = {"action": "write", **data}
+    action = data.get("action", "write")
+    if action == "write":
+        path = data.get("path")
+        if not path:
+            return None
+        content = data.get("content")
+        if content is None:
+            content = ""
+        return {"action": "write", "path": str(path), "content": str(content)}
+    if action == "run":
+        cmd = data.get("command") or data.get("cmd")
+        if not cmd:
+            return None
+        return {"action": "run", "command": str(cmd)}
+    return None
+
+def parse_fs_call(text):
+    if not text or not text.strip():
+        return None
+    candidates = []
+    for block in re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.S | re.I):
+        block = block.strip()
+        if block:
+            candidates.append(block)
+    candidates.extend(extract_json_objects(text))
+    seen = set()
+    for c in reversed(candidates):
+        if c in seen:
+            continue
+        seen.add(c)
+        data = try_parse_json(c)
+        if data is None:
+            continue
+        call = normalize_fs_call(data)
+        if call:
+            return call
+    return None
+
+def local_fs_prompt(write_root):
+    root = str(write_root)
+    return (
+        "\n\nLOCAL FILESYSTEM ACCESS:\n"
+        "You are running HackClub AI on the user's computer with direct file access. "
+        "Never say you cannot write files to their machine.\n"
+        f"Default output directory: {root}\n"
+        "WHEN CREATING OR EDITING FILES:\n"
+        "- Output ONLY this JSON (no markdown fences, no prose before/after):\n"
+        f'  {{"fs":{{"action":"write","path":"{root}/index.html","content":"..."}}}}\n'
+        "- Put the COMPLETE file contents inside content — nowhere else.\n"
+        "- Do NOT show the same code in your chat reply. One sentence confirmation after write is enough.\n"
+        f"Paths support ~ expansion. Relative paths resolve under {root}.\n"
+        f'To run a shell command: {{"fs":{{"action":"run","command":"open {root}/index.html"}}}}\n'
+    )
+
+def fs_nudge_message(attempt):
+    return (
+        "You pasted code in chat instead of writing to disk.\n"
+        "Reply with ONLY valid JSON (no markdown, no explanation):\n"
+        '{"fs":{"action":"write","path":"~/path/to/file.ext","content":"..."}}\n'
+        "The full file body goes in content only. Do not repeat it outside the JSON."
+    )
+
+FS_MAX_NUDGES = 2
+
+def user_wants_fs(prompt, shell=None):
+    p = (prompt or "").lower()
+    if shell and (shell.session_mode == "goal" or shell.goal):
+        return True
+    triggers = (
+        "build", "create", "write", "save", "file", "html", "website", "web page",
+        "implement", "scaffold", "generate", "make me", "index.html", "script",
+        "to my computer", "to disk", "locally", "documents folder", "home directory",
+        "single file", "open in browser", "deploy locally",
+    )
+    return any(t in p for t in triggers)
+
+def looks_like_code_without_fs(text):
+    if not text or not text.strip():
+        return False
+    if parse_fs_call(text):
+        return False
+    if parse_mcp_call(text):
+        return False
+    if "```" in text:
+        return True
+    low = text.lower()
+    if len(text) > 1200 and any(m in low for m in ("<!doctype", "<html", "function ", "def ", "class ", "import ")):
+        return True
+    return False
+
+def fs_continue_message():
+    return (
+        "Filesystem result above.\n"
+        "- Task incomplete → reply with ONLY valid JSON: "
+        '{"fs":{"action":"write","path":"...","content":"..."}}\n'
+        "- Or run a command: {\"fs\":{\"action\":\"run\",\"command\":\"...\"}}\n"
+        "- Double quotes, no trailing commas.\n"
+        "- When done, summarize in plain language what was created."
+    )
+
+FS_MAX_STEPS = 12
 
 def parse_mcp_call(text):
     if not text or not text.strip():
@@ -1334,28 +1449,22 @@ def safe(fn, default=None):
         return default
 
 class Shell:
-    def __init__(self):
-        key = os.getenv(API_KEY)
+    def __init__(self, api_key=None):
+        key = (api_key or load_api_key()).strip()
         if not key:
-            raise SystemExit(f"Missing {API_KEY}. Run: export {API_KEY}=...")
+            raise ValueError(f"Missing {API_KEY}")
+        os.environ[API_KEY] = key
         HOME.mkdir(parents=True, exist_ok=True)
         self.blocks = []
         self._frag_lock = threading.Lock()
         self.stream_i = None
-        self.app = None
+        self.ui_delegate = None
         self.busy = False
-        self.input_buffer = Buffer(
-            completer=Slash(),
-            history=FileHistory(str(HOME / "history")),
-            multiline=True,
-            complete_while_typing=False,
-        )
-        self.input_control = None
-        self.slash_menu_index = 0
         self.cache = Cache()
         self.client = OpenRouter(api_key=key, server_url=API_URL)
         self.mcp = MCP(self.cache)
         self.model = default_model()
+        self.reasoning_level = normalize_reasoning_for_model(self.model, load_prefs().get("reasoning"))
         self.history = []
         self.attachments = []
         self.last = ""
@@ -1365,9 +1474,6 @@ class Shell:
         self.mcp_tool_count = 0
         self._status_ver = 0
         self.follow_output = False
-        self.output_pane = None
-        self.mode = "playground"
-        self.workspace_name = None
         self._keep_at_top = True
         self._body_ver = 0
         self.output_control = None
@@ -1375,190 +1481,320 @@ class Shell:
         prefs = load_prefs()
         self.theme_name = prefs.get("theme", "dark")
         self.compact = prefs.get("compact", False)
+        self.session_mode = "main"
+        self.transcript_summary = None
+        self.goal = None
+        self.goal_paused = False
+        self.goal_started_at = None
+        self.goal_elapsed_before_pause = 0.0
         self.system = (
             "You are concise, accurate, and practical. Answer the user directly. "
             "Do not bring up Composio, MCP, or third-party integrations unless the user "
             "explicitly asks to use an external app or service."
         )
         self._last_touch = 0.0
+        self.session_id = None
+        self._session_created_at = None
+        self._resumed_session = False
+        self._session_lock = threading.Lock()
+        self._stop_requested = threading.Event()
+        self.custom_title = None
 
-    def _ui_invalidate(self, scroll_bottom=False):
+    def display_title(self):
+        return session_display_title(self.history, self.custom_title)
+
+    def rename_session(self, title):
+        title = (title or "").strip()
+        self.custom_title = title or None
+        self.persist_session()
+        return self.display_title()
+
+    def update_api_key(self, key):
+        key = (key or "").strip()
+        if not key:
+            raise ValueError(f"Missing {API_KEY}")
+        save_api_key(key)
+        self.client = OpenRouter(api_key=key, server_url=API_URL)
+
+    def update_composio_key(self, key):
+        save_composio_key(key)
+        self.mcp = MCP(self.cache)
+        self.refresh_mcp_tools()
+        self.refresh_status(invalidate=True)
+
+    def stop_generation(self):
+        if self.busy:
+            self._stop_requested.set()
+
+    def _stopped(self):
+        return self._stop_requested.is_set()
+
+    def _clear_stop(self):
+        self._stop_requested.clear()
+
+    def _finalize_stream_blocks(self, out, think, out_i, think_i, spin_i, end_spin):
+        end_spin()
+        with self._frag_lock:
+            if out_i is not None and out_i < len(self.blocks) and out.strip():
+                self.blocks[out_i].text = out.rstrip() + "\n"
+                self.blocks[out_i].kind = "md"
+            if think.strip() and not self.compact:
+                block = UiBlock("think", think.rstrip() + "\n")
+                if think_i is not None and think_i < len(self.blocks):
+                    self.blocks[think_i] = block
+                elif out_i is not None and out_i < len(self.blocks):
+                    self.blocks.insert(out_i, block)
+                else:
+                    self.blocks.append(block)
+            elif think_i is not None and think_i < len(self.blocks):
+                self.blocks.pop(think_i)
+
+    def session_file(self):
+        if not self.session_id:
+            return None
+        return SESSIONS_DIR / f"{self.session_id}.json"
+
+    def session_payload(self):
+        return {
+            "id": self.session_id,
+            "title": self.display_title(),
+            "custom_title": self.custom_title,
+            "created_at": self._session_created_at or time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "updated_at": getattr(self, "_last_activity", None) or time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "history": self.history,
+            "transcript_summary": self.transcript_summary,
+            "model": self.model,
+            "reasoning_level": self.reasoning_level,
+            "session_mode": self.session_mode,
+            "goal": self.goal,
+            "goal_paused": self.goal_paused,
+            "goal_elapsed_before_pause": self.goal_elapsed_before_pause,
+            "system": self.system,
+            "last": self.last,
+            "session_usage": {
+                "input": self.session_usage.input,
+                "output": self.session_usage.output,
+                "cached": self.session_usage.cached,
+            },
+            "attachments": [
+                {"id": a.id, "path": str(a.path), "name": a.name}
+                for a in self.attachments
+            ],
+        }
+
+    def persist_session(self):
+        if not self.session_id:
+            return
+        with self._session_lock:
+            path = self.session_file()
+            if not path:
+                return
+            write_json_atomic(path, self.session_payload())
+            save_prefs({"last_session_id": self.session_id})
+
+    def begin_session(self):
+        self.session_id = make_session_id()
+        self._session_created_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self._last_activity = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self._resumed_session = False
+        self.custom_title = None
+        self.persist_session()
+
+    def _restore_attachment(self, path, att_id=None):
+        p = Path(path).expanduser()
+        if not p.exists():
+            return False
+        use_id = att_id if att_id is not None else self.aid
+        att = self.indexer.load(str(p), use_id)
+        if not att:
+            return False
+        self.attachments.append(att)
+        self.aid = max(self.aid, att.id + 1)
+        return True
+
+    def apply_saved_session(self, data):
+        self.session_id = data.get("id") or make_session_id()
+        self._session_created_at = data.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%S")
+        self._last_activity = data.get("updated_at") or time.strftime("%Y-%m-%dT%H:%M:%S")
+        self.history = list(data.get("history") or [])
+        self.custom_title = (data.get("custom_title") or "").strip() or None
+        self.transcript_summary = data.get("transcript_summary")
+        if data.get("model"):
+            self.model = data["model"]
+        if data.get("reasoning_level"):
+            self.reasoning_level = normalize_reasoning_for_model(self.model, data.get("reasoning_level"))
+        self.session_mode = data.get("session_mode") or "main"
+        self.goal = data.get("goal")
+        self.goal_paused = bool(data.get("goal_paused"))
+        self.goal_elapsed_before_pause = float(data.get("goal_elapsed_before_pause") or 0)
+        self.goal_started_at = time.time() if self.goal and not self.goal_paused else None
+        if data.get("system"):
+            self.system = data["system"]
+        self.last = data.get("last") or ""
+        su = data.get("session_usage") or {}
+        self.session_usage = Usage(
+            input=int(su.get("input") or 0),
+            output=int(su.get("output") or 0),
+            cached=int(su.get("cached") or 0),
+        )
+        self.attachments = []
+        self.aid = 1
+        for att in data.get("attachments") or []:
+            self._restore_attachment(att.get("path"), att.get("id"))
+        self._resumed_session = True
+        self.persist_session()
+
+    def restore_session_ui(self):
+        blocks = [
+            UiBlock("text", BANNER + "\n", "class:label"),
+            UiBlock("text", f"resumed [{self.session_id}]  ·  {len(self.history) // 2} turns\n", "class:dim"),
+        ]
+        blocks.append(UiBlock("text", "/attach to add files or folders\n", "class:dim"))
+        blocks.append(UiBlock("welcome_model", self._welcome_model_text(), "class:dim"))
+        for a in self.attachments:
+            p = a.path
+            if p.is_dir():
+                line = f"Attached #{a.id}  {p.name}/  ·  {a.files} files  ·  {a.chars:,} chars"
+            else:
+                line = f"Attached #{a.id}  {p.name}  ·  {a.chars:,} chars"
+            blocks.append(UiBlock("attach", line))
+        if self.transcript_summary:
+            blocks.append(UiBlock("notify", f"compact summary loaded ({len(self.transcript_summary):,} chars)", "class:dim"))
+        for m in self.history:
+            role = m.get("role")
+            content = message_text(m.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "user":
+                blocks.append(UiBlock("user", content))
+                blocks.append(UiBlock("asst", ""))
+            elif role == "assistant":
+                blocks.append(UiBlock("md", content + "\n"))
+        with self._frag_lock:
+            self.blocks = blocks
+        self.follow_output = False
+        self._keep_at_top = True
+        self.session_info()
+        self.ui_invalidate()
+
+    def sessions_cmd(self):
+        sessions = list_saved_sessions()
+        if not sessions:
+            return self.info("no saved sessions — use HackClub AI → File → Resume Session to pick one on launch")
+        self.ui("Saved sessions", "class:label")
+        for i, s in enumerate(sessions[:20], 1):
+            self.ui(f"  {format_session_line(s, i)}")
+        self.info("resume on launch: HackClub AI → File → Resume Session  or  HackClub AI → File → Resume Session <id>")
+
+    def rename_cmd(self, rest):
+        title = (rest or "").strip()
+        if not title and self.ui_delegate and hasattr(self.ui_delegate, "prompt_rename"):
+            title = self.ui_delegate.prompt_rename(self.display_title())
+        if not title:
+            return self.warn("usage: /rename <title>")
+        name = self.rename_session(title)
+        if self.ui_delegate:
+            self.ui_delegate.requestRefresh()
+        return self.ok(f"renamed to: {name}")
+
+    def ui_invalidate(self, scroll_bottom=False):
         if scroll_bottom:
             self.follow_output = True
             self._keep_at_top = False
-        if self.app:
-            self.app.invalidate()
-
-    def _finish_stream_ui(self):
-        def do():
-            self.follow_output = True
-            self._keep_at_top = False
-            self._body_ver += 1
-            if self.output_control:
-                self.output_control.reset()
-            if self.output_pane:
-                self.output_pane.vertical_scroll = 10**9
-            app = self.app
-            if app:
-                app._invalidated = False
-                app.invalidate()
-
-        if self.app and getattr(self.app, "loop", None) and not self.app.loop.is_closed():
-            self.app.loop.call_soon_threadsafe(do)
-            self.app.loop.call_soon_threadsafe(lambda: self.app.loop.call_later(0.06, do))
-        else:
-            do()
+            if self.ui_delegate:
+                try:
+                    self.ui_delegate.scroll_to_bottom()
+                except Exception:
+                    pass
+        if self.ui_delegate:
+            self.ui_delegate.requestRefresh()
 
     def refresh_status(self, invalidate=True):
         self._status_ver += 1
-        if invalidate and self.app:
-            self.app.invalidate()
+        if invalidate:
+            if self.ui_delegate and hasattr(self.ui_delegate, "refresh_status_bar"):
+                self.ui_delegate.refresh_status_bar()
+            else:
+                self.ui_invalidate()
+
+    def follow_latest(self, force=False):
+        now = time.time()
+        if force or now - self._last_touch >= FOLLOW_MIN_S:
+            self._last_touch = now
+            self.follow_output = True
+            self._keep_at_top = False
+            self.ui_invalidate(scroll_bottom=True)
 
     def touch_body(self, scroll_bottom=False):
-        self._body_ver += 1
-        if scroll_bottom:
-            self.follow_output = True
         now = time.time()
-        if scroll_bottom and now - self._last_touch < STREAM_REDRAW_S:
+        if now - self._last_touch < STREAM_REDRAW_S:
             return
         self._last_touch = now
-        if self.app and getattr(self.app, "loop", None) and not self.app.loop.is_closed():
-            self.app.loop.call_soon_threadsafe(lambda: self._ui_invalidate(scroll_bottom))
-        else:
-            self._ui_invalidate(scroll_bottom)
-
-    def repaint_output(self, scroll_bottom=False):
         self._body_ver += 1
-        if scroll_bottom:
-            self._finish_stream_ui()
-        else:
-            self._ui_invalidate()
-    def follow_latest(self, force=False):
-        if getattr(self, "_keep_at_top", False):
-            if self.output_pane:
-                self.output_pane.vertical_scroll = 0
-            self._ui_invalidate()
+        self.ui_invalidate(scroll_bottom=scroll_bottom)
+
+    def _finish_stream_ui(self):
+        self.ui_invalidate(scroll_bottom=True)
+
+    def show_welcome(self):
+        welcome = [
+            UiBlock("text", BANNER + "\n", "class:label"),
+            UiBlock("text", "/attach to add files or folders\n", "class:dim"),
+            UiBlock("welcome_model", self._welcome_model_text(), "class:dim"),
+        ]
+        with self._frag_lock:
+            self.blocks = welcome
+            self._welcome_blocks = list(welcome)
+        self.session_info()
+        self.ui_invalidate()
+
+    def submit_line(self, line):
+        if self.busy:
             return
-        if force:
-            self.follow_output = True
-        if not self.follow_output:
+        line = normalize_input(line)
+        if not line:
             return
-        now = time.time()
-        if not force and now - getattr(self, "_follow_ts", 0) < FOLLOW_MIN_S:
+        if line.lower() in {"/exit", "/quit", "exit", "quit"}:
+            self.exit_cmd()
             return
-        self._follow_ts = now
-        self._ui_invalidate(scroll_bottom=True)
-    def scroll_output(self, delta):
-        if not self.output_pane:
-            return
-        if delta < 0:
-            self.follow_output = False
-        pane = self.output_pane
-        pane.vertical_scroll = max(0, min(pane._max_scroll, pane.vertical_scroll + delta))
-        if delta > 0 and pane.vertical_scroll >= max(0, pane._max_scroll - 1):
-            self.follow_output = True
-        if self.app:
-            self.app.invalidate()
-    def refresh_mcp_count(self):
-        try:
-            self.mcp_tool_count = len([t for t in self.mcp.tools() if t["name"] != "ERROR"])
-        except Exception:
-            self.mcp_tool_count = 0
+        self._dispatch(line, sync=False)
+
     def _ensure_ui(self):
         if not hasattr(self, "_frag_lock"):
             self._frag_lock = threading.Lock()
         if not hasattr(self, "blocks"):
             self.blocks = []
+
     def ui(self, text, style="class:text", nl=True):
         self._ensure_ui()
         with self._frag_lock:
             self.blocks.append(UiBlock("text", text + ("\n" if nl else ""), style))
-        if self.app:
-            self.app.invalidate()
+        if self.ui_delegate:
+            self.ui_delegate.requestRefresh()
     def notify(self, msg, style):
         self._ensure_ui()
         with self._frag_lock:
             self.blocks.append(UiBlock("notify", msg + "\n", style))
-        if self.app:
-            self.app.invalidate()
-    def slash_fragment(self):
-        line = self.input_buffer.document.current_line
-        m = re.search(r"(/\S*)$", line)
-        if not m:
-            return None
-        frag = m.group(1)
-        if " " in frag:
-            return None
-        return frag.lower()
-    def slash_menu_open(self):
-        if self.busy:
-            return False
-        return self.slash_fragment() is not None
-    def slash_matches(self):
-        frag = self.slash_fragment() or "/"
-        return [c for c in sorted(COMMANDS) if c.startswith(frag)]
-    def apply_slash_selection(self, trailing_space=False):
-        matches = self.slash_matches()
-        if not matches:
-            return
-        idx = max(0, min(self.slash_menu_index, len(matches) - 1))
-        cmd = matches[idx]
-        doc = self.input_buffer.document
-        line = doc.current_line
-        m = re.search(r"(/\S*)$", line)
-        if not m:
-            return
-        suffix = " " if trailing_space else ""
-        line_start = doc.cursor_position - len(line)
-        start = line_start + m.start(1)
-        text = self.input_buffer.text
-        new = text[:start] + cmd + suffix + text[start + len(m.group(1)):]
-        self.input_buffer.document = Document(new, cursor_position=start + len(cmd) + len(suffix))
-        self.slash_menu_index = 0
-        if self.app:
-            self.app.invalidate()
-    def render_slash_menu(self):
-        matches = self.slash_matches()
-        if not matches:
-            return [("class:dim", "  no matching commands\n")]
-        self.slash_menu_index = max(0, min(self.slash_menu_index, len(matches) - 1))
-        width = max(40, self.body_width())
-        cmd_w = min(28, max(18, width // 3))
-        out = []
-        visible = matches[:SLASH_MENU_LINES]
-        scroll = 0
-        if len(matches) > SLASH_MENU_LINES and self.slash_menu_index >= SLASH_MENU_LINES:
-            scroll = min(self.slash_menu_index - SLASH_MENU_LINES + 1, len(matches) - SLASH_MENU_LINES)
-            visible = matches[scroll:scroll + SLASH_MENU_LINES]
-        for i, cmd in enumerate(visible):
-            real_i = scroll + i
-            selected = real_i == self.slash_menu_index
-            prefix = "→ " if selected else "  "
-            desc = CMD_DESCRIPTIONS.get(cmd, "")
-            cmd_style = "class:slash_sel" if selected else "class:slash_cmd"
-            desc_style = "class:slash_sel_desc" if selected else "class:slash_desc"
-            out.append((cmd_style, prefix + cmd.ljust(cmd_w)))
-            out.append((desc_style, desc + "\n"))
-        hidden = len(matches) - (scroll + len(visible))
-        if hidden > 0:
-            out.append(("class:dim", f"  ↓ {hidden} more below\n"))
-        return out
+        if self.ui_delegate:
+            self.ui_delegate.requestRefresh()
     def body_width(self):
-        try:
-            if self.app and getattr(self.app, "output", None):
-                size = self.app.output.get_size()
-                if size and size.columns:
-                    return max(40, size.columns - 2)
-        except Exception:
-            pass
-        return max(40, shutil.get_terminal_size(fallback=(100, 24)).columns - 2)
+        if self.ui_delegate:
+            try:
+                return self.ui_delegate.body_width()
+            except Exception:
+                pass
+        return 80
     def render_body(self):
         self._ensure_ui()
         _ = self._body_ver
         with self._frag_lock:
             blocks = list(self.blocks)
+            welcome_blocks = getattr(self, "_welcome_blocks", None)
         if not blocks:
             return [("class:dim", "")]
+        if welcome_blocks and any(b.kind == "user" for b in blocks):
+            welcome_ids = {id(b) for b in welcome_blocks}
+            blocks = [b for b in blocks if id(b) not in welcome_ids]
         width = self.body_width()
         if self.compact and len(blocks) > 48:
             blocks = blocks[-48:]
@@ -1571,7 +1807,8 @@ class Shell:
             if b.kind == "user":
                 prev_kind = blocks[i - 1].kind if i > 0 else None
                 if i > 0 and prev_kind not in WELCOME_KINDS:
-                    out.append(("class:text", BLANK))
+                    gap = NOTIFY_USER_GAP if prev_kind == "notify" else BLANK
+                    out.append(("class:text", gap))
                 rule = "─" * min(max(24, width - 4), 72)
                 out.append(("class:sep", f"{rule}{LINE}"))
                 out.append(("class:text", RULE_GAP))
@@ -1590,8 +1827,12 @@ class Shell:
                     out.append(("class:text", BLANK))
             elif b.kind == "asst":
                 out.append(("class:asst_label", f"Assistant{HEADER_GAP}"))
-            elif b.kind == "md":
-                if self.compact:
+            elif b.kind in ("md", "stream"):
+                if b.kind == "stream":
+                    pad = " " * CONTENT_INDENT
+                    for line in b.text.splitlines() or [""]:
+                        out.append(("class:text", pad + line + LINE))
+                elif self.compact:
                     text = re.sub(r"\s+", " ", b.text.strip())
                     if len(text) > 240:
                         text = text[:240] + "..."
@@ -1600,12 +1841,13 @@ class Shell:
                     out.extend(md_to_fragments(b.text, width, indent=CONTENT_INDENT))
                     if not b.text.endswith("\n"):
                         out.append(("class:text", LINE))
-            elif b.kind == "think":
+            elif b.kind in ("think", "think_live"):
                 if self.compact:
                     continue
                 if b.text.strip():
                     pad = " " * THINK_INDENT
-                    out.append(("class:think_label", pad + f"thinking{HEADER_GAP}"))
+                    header = "Reasoning" if b.kind == "think_live" else "Reasoned"
+                    out.append(("class:think_label", pad + f"{header}{HEADER_GAP}"))
                     out.extend(md_to_fragments(b.text, width, indent=THINK_INDENT, tone="think"))
                     if not b.text.endswith("\n"):
                         out.append(("class:text", LINE))
@@ -1615,7 +1857,7 @@ class Shell:
                         if not (not nxt_text and nxt2 == "notify"):
                             out.append(("class:text", THINK_REPLY_GAP))
             elif b.kind == "spin":
-                out.append(("class:dim", "  " + b.text + LINE))
+                out.append((b.style or "class:spin", "  " + b.text + LINE))
             elif b.kind == "attach":
                 out.append(("class:attach", f"{BLANK}{b.text}{LINE}"))
             elif b.kind == "notify":
@@ -1627,13 +1869,45 @@ class Shell:
                 elif prev_kind in ("md", "think"):
                     out.append(("class:text", BLANK))
                 out.append((b.style, b.text))
-                if nxt is not None:
+                if nxt is not None and nxt != "user":
                     out.append(("class:text", THINK_TOOL_GAP))
             else:
                 out.append((b.style, b.text))
                 if nxt is not None and b.kind in WELCOME_KINDS and nxt in WELCOME_KINDS:
                     continue
         return out
+    def write_root(self):
+        for a in self.attachments:
+            if getattr(a, "path", None):
+                p = Path(a.path).expanduser().resolve()
+                return p if p.is_dir() else p.parent
+        return Path.home()
+
+    def resolve_fs_path(self, path):
+        p = Path(path).expanduser()
+        if not p.is_absolute():
+            p = self.write_root() / p
+        return p
+
+    def execute_fs_call(self, call):
+        if call["action"] == "write":
+            path = self.resolve_fs_path(call["path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(call["content"], encoding="utf-8")
+            return f"Wrote {len(call['content'])} bytes to {path}"
+        if call["action"] == "run":
+            r = subprocess.run(
+                call["command"],
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=str(self.write_root()),
+            )
+            out = (r.stdout or "") + (r.stderr or "")
+            return f"exit {r.returncode}\n{out[:15000]}".strip()
+        raise ValueError(f"unknown fs action: {call.get('action')}")
+
     def info(self, msg): self.notify(msg, "class:dim")
     def ok(self, msg): self.notify(msg, "class:ok")
     def warn(self, msg): self.notify(msg, "class:warn")
@@ -1655,16 +1929,38 @@ class Shell:
             if tot_cached:
                 tok += f"  cached {tot_cached}"
             if self.compact:
-                bits = [self.model_label(), f"ctx {ctx:.0f}%", mcp, tok]
+                bits = [self.model_display_label(), f"ctx {ctx:.0f}%", mcp, tok]
                 return " | ".join(bits)
-            bits = [self.model_label(), f"ctx {ctx:.0f}%", mcp, f"turns {len(self.history)//2}", tok]
-            if self.mode == "workspace" and self.workspace_name:
-                bits.insert(1, f"ws:{self.workspace_name}")
-            elif self.mode == "playground":
-                bits.insert(1, "playground")
-            return "  ".join(bits)
+            bits = [self.model_display_label(), f"ctx {ctx:.0f}%", mcp, f"turns {len(self.history)//2}", tok]
+            if self.session_mode != "main":
+                bits.insert(1, self.session_mode)
+            if self.transcript_summary:
+                bits.insert(1, "compact")
+            left = "  ".join(bits)
+            if self.goal:
+                timer = self.format_goal_timer()
+                right = f"⏱ {timer}" + (" paused" if self.goal_paused else "")
+                width = max(len(left) + len(right) + 2, self.body_width())
+                pad = max(2, width - len(left) - len(right))
+                return left + (" " * pad) + right
+            return left
         except Exception:
             return "in 0  out 0"
+    def usage_summary(self):
+        def _h(n):
+            n = int(n or 0)
+            if n >= 1_000_000:
+                return f"{n / 1_000_000:.1f}M"
+            if n >= 1000:
+                return f"{n / 1000:.1f}k"
+            return str(n)
+        try:
+            ctx = self.ctx_pct()
+            tot_in = self.session_usage.input + self.usage.input
+            tot_out = self.session_usage.output + self.usage.output
+            return f"ctx {ctx:.0f}%   ·   in {_h(tot_in)}   ·   out {_h(tot_out)}"
+        except Exception:
+            return "ctx 0%   ·   in 0   ·   out 0"
     def render_status(self):
         return [("class:status", self.status_text())]
     def apply_theme(self, name):
@@ -1672,30 +1968,340 @@ class Shell:
             return self.warn(f"unknown theme: {name} (dark, light)")
         self.theme_name = name
         save_prefs({"theme": name, "compact": self.compact, "model": self.model})
-        if self.app:
-            self.app.style = pt_style(name)
-            self.app.invalidate()
+        if self.ui_delegate:
+            try:
+                self.ui_delegate.apply_theme(name)
+            except Exception:
+                pass
+        self.ui_invalidate()
         self.ok(f"theme: {name}")
     def max_history_msgs(self):
         return 6 if self.compact else MAX_TURNS * 2
     def max_ctx_limit(self):
         return MAX_CTX // 4 if self.compact else MAX_CTX
+    def history_budget(self):
+        return HISTORY_BUDGET // 4 if self.compact else HISTORY_BUDGET
+    def history_window(self):
+        # Most-recent-first selection bounded by both a message cap and a char budget,
+        # so a few huge turns can't blow up per-request input on long-context chats.
+        cap = self.max_history_msgs()
+        budget = self.history_budget()
+        recent = self.history[-cap:]
+        chosen = []
+        total = 0
+        for m in reversed(recent):
+            size = len(message_text(m.get("content", "")))
+            if chosen and total + size > budget:
+                break
+            chosen.append(m)
+            total += size
+        chosen.reverse()
+        # Never split a turn: if we start on an assistant reply with no preceding
+        # user turn in-window, drop it so the window begins on a user message.
+        if chosen and chosen[0].get("role") == "assistant" and len(chosen) > 1:
+            chosen = chosen[1:]
+        return chosen
+    def live_input_chars(self):
+        # Approximate size of the actual per-request input (attachments + summary +
+        # in-window history), independent of cumulative session totals.
+        hist = sum(len(message_text(m.get("content", ""))) for m in self.history_window())
+        summ = len(self.transcript_summary or "")
+        return self.ctx_chars() + hist + summ
+    def live_ctx_pct(self):
+        return min(100.0, (self.live_input_chars() // 4) / CTX_WINDOW * 100)
     def _trim_ui(self):
         with self._frag_lock:
             if len(self.blocks) > 48:
                 self.blocks = self.blocks[-48:]
-        if self.app:
-            self.app.invalidate()
-    def toggle_compact(self, rest):
-        if rest in {"on", "off"}:
-            self.compact = rest == "on"
-        else:
-            self.compact = not self.compact
-        save_prefs({"theme": self.theme_name, "compact": self.compact, "model": self.model})
-        if self.compact:
-            self._trim_ui()
-            self.history = self.history[-self.max_history_msgs():]
-        self.ok(f"compact: {'on' if self.compact else 'off'}")
+        if self.ui_delegate:
+            self.ui_delegate.requestRefresh()
+    def goal_elapsed_s(self):
+        if not self.goal:
+            return 0
+        total = self.goal_elapsed_before_pause
+        if self.goal_started_at and not self.goal_paused:
+            total += time.time() - self.goal_started_at
+        return total
+    def format_goal_timer(self):
+        s = int(self.goal_elapsed_s())
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        if h:
+            return f"{h}:{m:02d}:{sec:02d}"
+        return f"{m}:{sec:02d}"
+    def mode_prompt(self):
+        parts = []
+        if self.session_mode in MODE_PROMPTS:
+            parts.append(MODE_PROMPTS[self.session_mode])
+        if self.goal and not self.goal_paused:
+            parts.append(
+                f"\n\nGOAL MODE — ACTIVE OBJECTIVE: {self.goal}\n"
+                "You are in relentless execution mode for this objective.\n"
+                "Stay tightly focused on the goal. Do NOT stop at partial progress, hand-wavy next steps, or suggestions.\n"
+                "Keep working across turns until the goal is fully implemented and verified.\n"
+                "If blocked, state the blocker briefly and immediately take the smallest action to unblock it.\n"
+                "When the goal is truly complete, say GOAL COMPLETE and summarize what was implemented and how to verify it."
+            )
+        elif self.goal and self.goal_paused:
+            parts.append(f"\n\nGOAL PAUSED: {self.goal}\nDo not advance the goal until the user resumes it.")
+        return "".join(parts)
+    def repo_root(self):
+        for a in self.attachments:
+            if a.path:
+                root = git_root(a.path)
+                if (root / ".git").exists():
+                    return root
+        return git_root(Path.cwd())
+    def call_model(self, msgs, model=None):
+        active = model or self.model
+        out = ""
+        for chunk in self.client.chat.send(
+            model=active,
+            messages=msgs,
+            reasoning=self.reasoning_request(active),
+            stream=True,
+        ):
+            if self._stopped():
+                break
+            self.read_usage(chunk, invalidate=False)
+            for kind, piece in self.delta_parts(chunk):
+                if kind != "reasoning":
+                    out += piece
+        return out.strip()
+    def _clear_chat_ui(self):
+        with self._frag_lock:
+            keep = []
+            for b in self.blocks:
+                if b.kind in WELCOME_KINDS or b.kind == "attach" or b.kind == "notify":
+                    keep.append(b)
+                elif b.kind == "text" and (b.text.startswith("/attach")):
+                    keep.append(b)
+                elif b.kind == "welcome_model":
+                    keep.append(b)
+            self.blocks = keep
+        if self.ui_delegate:
+            self.ui_delegate.requestRefresh()
+    def compact_transcript(self):
+        if not self.history and not self.transcript_summary:
+            return self.info("nothing to compact")
+        self.info("summarizing transcript...")
+        lines = []
+        if self.transcript_summary:
+            lines.append(f"PRIOR SUMMARY:\n{self.transcript_summary}")
+        for m in self.history:
+            role = m.get("role", "?").upper()
+            lines.append(f"{role}: {message_text(m.get('content', ''))}")
+        transcript = "\n\n".join(lines)
+        prompt = (
+            "Compress this conversation into a dense structured brief for future model context. "
+            "Preserve decisions, constraints, open questions, current task state, file paths, and technical details. "
+            "Use sections and bullets. Stay under 2000 words.\n\n" + transcript
+        )
+        try:
+            summary = self.call_model([
+                {"role": "system", "content": "You summarize chat transcripts without losing actionable detail."},
+                {"role": "user", "content": prompt},
+            ])
+        except Exception as e:
+            return self.err(f"compact failed: {e}")
+        if self._stopped():
+            return self.warn("generation stopped")
+        if not summary:
+            return self.err("compact failed: empty summary")
+        self.transcript_summary = summary
+        self.history.clear()
+        self._clear_chat_ui()
+        self.persist_session()
+        self.info(f"transcript compacted ({len(summary):,} chars) — previous turns replaced by summary")
+        self.refresh_status()
+    def auto_compact_if_needed(self):
+        # Fold the oldest turns into a rolling summary once live context crosses the
+        # threshold. Unlike /compact this keeps the visible transcript intact and only
+        # shrinks what is sent to the model, preserving detail in the summary.
+        if self.session_mode == "side" or self.compact or self._stopped():
+            return False
+        try:
+            if self.live_ctx_pct() < AUTO_COMPACT_PCT:
+                return False
+        except Exception:
+            return False
+        keep = max(2, AUTO_COMPACT_KEEP)
+        if len(self.history) <= keep + 2:
+            return False
+        old = self.history[:-keep]
+        recent = self.history[-keep:]
+        lines = []
+        if self.transcript_summary:
+            lines.append(f"PRIOR SUMMARY:\n{self.transcript_summary}")
+        for m in old:
+            lines.append(f"{m.get('role', '?').upper()}: {message_text(m.get('content', ''))}")
+        prompt = (
+            "Update the running brief for this conversation so future turns stay grounded. "
+            "Merge any prior summary with the new turns into one dense brief. "
+            "Preserve decisions, constraints, open questions, task state, file paths, and key facts. "
+            "Use sections and bullets. Stay under 1500 words.\n\n" + "\n\n".join(lines)
+        )
+        try:
+            summary = self.call_model([
+                {"role": "system", "content": "You maintain a compact running brief of a chat without losing actionable detail."},
+                {"role": "user", "content": prompt},
+            ])
+        except Exception:
+            return False
+        if self._stopped() or not summary or not summary.strip():
+            return False
+        self.transcript_summary = summary.strip()
+        self.history = recent
+        self.persist_session()
+        self.info(f"auto-compacted older turns to keep context lean (summary {len(summary):,} chars)")
+        self.refresh_status()
+        return True
+    def side_cmd(self, rest):
+        rest = (rest or "").strip()
+        if not rest:
+            return self.warn("usage: /side <question>")
+        old = self.session_mode
+        self.session_mode = "side"
+        try:
+            self.send(rest)
+        finally:
+            self.session_mode = old
+    def plan_cmd(self, rest):
+        self.session_mode = "main" if self.session_mode == "plan" else "plan"
+        self.ok(f"plan mode: {'on' if self.session_mode == 'plan' else 'off'}")
+    def grill_me_cmd(self, rest):
+        rest = (rest or "").strip()
+        prompt = GRILL_KICKOFF
+        if rest:
+            prompt += f"\n\nAdditional focus: {rest}"
+        old = self.session_mode
+        self.session_mode = "grill"
+        try:
+            self.send(prompt)
+        finally:
+            self.session_mode = old
+    def _start_goal(self, text):
+        self.goal = text.strip()
+        self.goal_paused = False
+        self.goal_started_at = time.time()
+        self.goal_elapsed_before_pause = 0.0
+        self.session_mode = "goal"
+        self.refresh_status()
+        self.ok(f"goal started — ⏱ {self.format_goal_timer()}")
+        self.send(f"GOAL: {self.goal}\n\n{GOAL_KICKOFF}")
+    def goal_cmd(self, rest):
+        rest = (rest or "").strip()
+        if not rest:
+            return self.warn("usage: /goal <objective>")
+        if rest == "clear":
+            self.goal = None
+            self.goal_started_at = None
+            self.goal_elapsed_before_pause = 0.0
+            self.goal_paused = False
+            if self.session_mode == "goal":
+                self.session_mode = "main"
+            self.refresh_status()
+            return self.info("goal cleared")
+        if rest == "pause":
+            if not self.goal:
+                return self.info("no active goal")
+            if not self.goal_paused:
+                self.goal_elapsed_before_pause = self.goal_elapsed_s()
+                self.goal_started_at = None
+                self.goal_paused = True
+                if self.session_mode == "goal":
+                    self.session_mode = "main"
+            self.refresh_status()
+            return self.ok(f"goal paused — ⏱ {self.format_goal_timer()}")
+        if rest == "resume":
+            if not self.goal:
+                return self.info("no active goal")
+            if self.goal_paused:
+                self.goal_started_at = time.time()
+                self.goal_paused = False
+                self.session_mode = "goal"
+            self.refresh_status()
+            return self.ok(f"goal resumed — ⏱ {self.format_goal_timer()}")
+        if rest == "show":
+            if not self.goal:
+                return self.info("no active goal")
+            state = "paused" if self.goal_paused else "active"
+            return self.info(f"goal ({state}, ⏱ {self.format_goal_timer()}): {self.goal}")
+        self._start_goal(rest)
+    def diff_cmd(self, rest):
+        root = self.repo_root()
+        if not (root / ".git").exists():
+            return self.err("not a git repository")
+        sections = []
+        for label, args in [
+            ("unstaged", ["git", "-C", str(root), "diff"]),
+            ("staged", ["git", "-C", str(root), "diff", "--cached"]),
+        ]:
+            code, out, err = run_cmd(args)
+            if code not in (0, 1):
+                return self.err(err or f"git diff failed ({label})")
+            if out.strip():
+                sections.append(f"## {label}\n```diff\n{out[:120000]}\n```")
+        code, out, _ = run_cmd(["git", "-C", str(root), "ls-files", "--others", "--exclude-standard"])
+        if code == 0 and out.strip():
+            untracked = out.strip().splitlines()
+            chunks = []
+            for rel in untracked[:40]:
+                p = root / rel
+                if p.is_file():
+                    try:
+                        body = p.read_text(errors="replace")
+                    except Exception:
+                        body = "(binary or unreadable)"
+                    chunks.append(f"--- a/{rel}\n+++ b/{rel}\n{body[:8000]}")
+            if chunks:
+                sections.append("## untracked\n```diff\n" + "\n\n".join(chunks)[:120000] + "\n```")
+        if not sections:
+            return self.info("working tree clean — no diff")
+        self.ui(f"Git diff — {root.name}", "class:label")
+        for sec in sections:
+            self.ui(sec)
+    def init_cmd(self, rest):
+        root = self.repo_root()
+        target = root / "AGENTS.md"
+        if target.exists() and rest != "force":
+            return self.warn(f"AGENTS.md already exists at {target} — run `/init force` to overwrite")
+        body = AGENTS_MD_TEMPLATE
+        target.write_text(body, encoding="utf-8")
+        self.ok(f"created {target}")
+    def review_cmd(self, rest):
+        prompt = REVIEW_PROMPT + (rest or "Review the attached files and folders.")
+        return self.send(prompt)
+    def yeet_cmd(self, rest):
+        root = self.repo_root()
+        if not (root / ".git").exists():
+            return self.err("not a git repository")
+        msg = rest.strip() or YEET_COMMIT_FALLBACK
+        steps = []
+        for label, args in [
+            ("stage", ["git", "-C", str(root), "add", "-A"]),
+            ("commit", ["git", "-C", str(root), "commit", "-m", msg]),
+            ("push", ["git", "-C", str(root), "push"]),
+        ]:
+            code, out, err = run_cmd(args)
+            text = (out or err).strip()
+            if label == "commit" and code != 0 and "nothing to commit" in text.lower():
+                return self.info("nothing to commit")
+            if code != 0:
+                return self.err(f"yeet failed at {label}: {text[:300]}")
+            steps.append(f"{label}: ok")
+        code, out, err = run_cmd(["gh", "pr", "create", "--fill"], cwd=root)
+        pr_text = (out or err).strip()
+        if code != 0:
+            return self.warn("committed and pushed, but PR creation failed: " + pr_text[:300])
+        self.ok("yeet complete — " + " · ".join(steps))
+        if pr_text:
+            self.info(pr_text)
+    def exit_cmd(self):
+        self.persist_session()
+        self._auto_refresh_attachments()
+        if self.ui_delegate:
+            self.ui_delegate.request_exit()
     def show_user(self, text):
         self._ensure_ui()
         with self._frag_lock:
@@ -1710,8 +2316,12 @@ class Shell:
         for name, mid in MODELS:
             if mid == self.model: return name
         return self.model
+    def reasoning_label(self, model=None, value=None):
+        return reasoning_label_for_model(model or self.model, self.reasoning_level if value is None else value)
+    def model_display_label(self):
+        return f"{self.model_label()} [{self.reasoning_label()}]"
     def _welcome_model_text(self):
-        return f"model: {self.model_label()}  ·  /help  ·  /model to switch\n"
+        return f"model: {self.model_display_label()}  ·  /help  ·  /model to switch\n"
     def _sync_welcome_model(self):
         text = self._welcome_model_text()
         updated = False
@@ -1723,8 +2333,8 @@ class Shell:
                     self.blocks[i] = UiBlock("welcome_model", text, b.style)
                     updated = True
                     break
-        if updated and self.app:
-            self.app.invalidate()
+        if updated and self.ui_delegate:
+            self.ui_delegate.requestRefresh()
     def ctx_chars(self):
         return sum(a.chars for a in self.attachments if a.kind == "text")
     def ctx_pct(self):
@@ -1738,226 +2348,99 @@ class Shell:
         elif self.mcp.enabled:
             self.info("mcp connected")
     def _ask_model_dialog(self):
-        return questionary_model_picker(self.model_label())
-    def _apply_model(self, val):
+        if self.ui_delegate:
+            return self.ui_delegate.pick_model()
+        return None
+    def reasoning_request(self, model=None):
+        active_model = model or self.model
+        effort = normalize_reasoning_for_model(active_model, self.reasoning_level)
+        if self.goal or self.session_mode == "goal":
+            if effort == "high":
+                effort = "medium"
+        return {"effort": effort}
+    def _apply_model(self, val, reasoning=None):
         if not val:
             return
         self.model = val
-        save_prefs({"model": val})
+        self.reasoning_level = normalize_reasoning_for_model(val, reasoning)
+        save_prefs({"model": val, "reasoning": self.reasoning_level})
         self._sync_welcome_model()
-        self.ok(f"model: {self.model_label()}")
+        self.ok(f"model: {self.model_display_label()}")
         self.refresh_status()
+        if self.ui_delegate and hasattr(self.ui_delegate, "sync_model_pickers"):
+            self.ui_delegate.sync_model_pickers()
     def set_model(self, rest):
         q = rest.strip()
         if not q:
-            return self.schedule_pick_model()
-        if q.isdigit():
-            idx = int(q) - 1
-            if 0 <= idx < len(MODELS):
-                mid = MODELS[idx][1]
-                if mid == "custom":
-                    return self.schedule_pick_model()
-                self.model = mid
-                save_prefs({"model": mid})
-                self._sync_welcome_model()
-                self.refresh_status()
-                return self.ok(f"model: {self.model_label()}")
-        ql = q.lower()
-        for n, mid in MODELS:
-            if ql == mid.lower() or ql in n.lower():
-                if mid == "custom":
-                    return self.schedule_pick_model()
-                self.model = mid
-                save_prefs({"model": mid})
-                self._sync_welcome_model()
-                self.refresh_status()
-                return self.ok(f"model: {self.model_label()}")
-        self.model = q
-        save_prefs({"model": q})
-        self._sync_welcome_model()
-        self.refresh_status()
-        return self.ok(f"model: {self.model_label()}")
+            return self.info("usage: /model <name> [variant]  ·  /model custom <openrouter-id> [variant]")
+        parsed = parse_model_command(q)
+        if parsed["kind"] == "variants":
+            model_id = parsed["model_id"]
+            reasoning = None
+            variant_q = parsed.get("variant_q", "")
+            if variant_q:
+                allowed = {effort for _, effort in reasoning_variants_for_model(model_id)}
+                aliases = {label.lower() for label, _ in reasoning_variants_for_model(model_id)}
+                last = variant_q.split()[-1]
+                if last in allowed or last in aliases:
+                    reasoning = normalize_reasoning_for_model(model_id, last)
+            return self._apply_model(model_id, reasoning)
+        if parsed["kind"] == "custom_id":
+            return self.warn("usage: /model custom <openrouter-model-id> [variant]")
+        mid, _, rest2 = split_model_query(q)
+        reasoning = None
+        if mid and rest2:
+            last = rest2.split()[-1].lower()
+            allowed = {effort for _, effort in reasoning_variants_for_model(mid)}
+            aliases = {label.lower() for label, _ in reasoning_variants_for_model(mid)}
+            if last in allowed or last in aliases:
+                reasoning = normalize_reasoning_for_model(mid, last)
+        if mid == "custom":
+            return self.warn("usage: /model custom <openrouter-model-id> [variant]")
+        if not mid:
+            mid = q.split()[0]
+        return self._apply_model(mid, reasoning)
     def schedule_pick_model(self):
-        if self.app:
-            self.app.create_background_task(self._pick_model_task())
-        else:
-            val = self._ask_model_dialog()
-            self._apply_model(val)
-    async def _pick_model_task(self):
-        try:
-            val = await run_in_terminal(self._ask_model_dialog, in_executor=True)
-        except Exception as e:
-            self.warn(f"model picker failed: {e}")
-            return
+        val = self._ask_model_dialog()
         self._apply_model(val)
     def pick_attach(self):
-        if self.app:
-            self.app.create_background_task(self._pick_attach_task())
-            return
-        kind = ask_attach_kind()
-        if not kind:
-            return
-        path = pick_path_for_kind(kind)
-        if path:
-            self.attach(path)
-    async def _pick_attach_task(self):
-        self.busy = True
-        if self.app:
-            self.app.invalidate()
-        try:
-            kind = await run_in_terminal(ask_attach_kind, in_executor=True)
-            if not kind:
-                return
-            path = await run_in_terminal(lambda: pick_path_for_kind(kind), in_executor=True)
+        if self.ui_delegate:
+            kind, path = self.ui_delegate.pick_attach_kind_and_path()
             if path:
                 self.attach(path)
-        except Exception as e:
-            self.warn(f"attach failed: {e}")
-        finally:
-            self.busy = False
-            if self.app:
-                self.app.invalidate()
-    async def _intro_animation(self):
-        welcome = [
-            UiBlock("text", BANNER + "\n", "class:label"),
-        ]
-        if self.mode == "workspace" and self.workspace_name:
-            welcome.append(UiBlock("text", f"workspace: {self.workspace_name}  ·  /context to view files\n", "class:dim"))
-        else:
-            welcome.append(UiBlock("text", "playground  ·  /attach to add files\n", "class:dim"))
-        welcome.append(UiBlock("welcome_model", self._welcome_model_text(), "class:dim"))
-        with self._frag_lock:
-            self.blocks = welcome + list(self.blocks)
-        self.follow_output = False
-        self._keep_at_top = True
-        if self.output_pane:
-            self.output_pane.vertical_scroll = 0
-        self.session_info()
-        if self.app:
-            self.app.invalidate()
-    def on_submit(self, buffer):
-        if self.busy:
-            return True
-        raw = buffer.text
-        line = normalize_input(raw)
-        if not line:
-            return False
-        if line.lower() in {"/exit", "exit", "quit"}:
-            if self.app:
-                self.app.exit()
-            return False
-        sync = line.startswith("/")
-        self._dispatch(line, sync=sync)
-        return False
+            return
+        path = pick_macos_path("file")
+        if path:
+            self.attach(path)
+
     def _dispatch(self, line, sync=False):
         def work():
+            self._clear_stop()
             self.busy = True
+            if self.ui_delegate:
+                try:
+                    self.ui_delegate.set_busy(True)
+                except Exception:
+                    pass
             try:
                 self.route(line)
             except Exception as e:
                 self.err(str(e))
             finally:
                 self.busy = False
+                if self.ui_delegate:
+                    try:
+                        self.ui_delegate.set_busy(False)
+                    except Exception:
+                        pass
                 if not sync:
                     self._finish_stream_ui()
-                elif self.app:
-                    self.app.invalidate()
+                else:
+                    self.ui_invalidate()
         if sync:
             work()
         else:
             threading.Thread(target=work, daemon=True).start()
-    def build_app(self):
-        self.input_buffer.accept_handler = self.on_submit
-
-        def on_input_change(_):
-            self.slash_menu_index = 0
-            if self.app:
-                self.app.invalidate()
-
-        self.input_buffer.on_text_changed += on_input_change
-        self.input_control = BufferControl(buffer=self.input_buffer)
-        self.output_control = FormattedTextControl(self.render_body, focusable=False)
-        self.output_pane = ChatScrollPane(
-            self,
-            Window(self.output_control, wrap_lines=True),
-        )
-        slash_menu_filter = Condition(lambda: self.slash_menu_open())
-        slash_menu = ConditionalContainer(
-            Window(
-                height=SLASH_MENU_LINES + 1,
-                content=FormattedTextControl(self.render_slash_menu, focusable=False),
-            ),
-            filter=slash_menu_filter,
-        )
-        root = HSplit([
-            self.output_pane,
-            Window(height=OUTPUT_BOTTOM_MARGIN, content=FormattedTextControl([("class:text", "")])),
-            Window(height=INPUT_PAD_Y, style="class:input_row"),
-            VSplit([
-                Window(width=INPUT_PAD_LEFT, height=1, style="class:input_row"),
-                Window(width=2, height=1, content=FormattedTextControl([("class:prompt", "→ ")]), style="class:input_row"),
-                Window(width=INPUT_PAD_AFTER_ARROW, height=1, style="class:input_row"),
-                Window(height=Dimension(min=1, max=INPUT_MAX_LINES), content=self.input_control, style="class:input_row"),
-                Window(width=INPUT_PAD_RIGHT, height=1, style="class:input_row"),
-            ]),
-            Window(height=INPUT_PAD_Y, style="class:input_row"),
-            Window(height=INPUT_SLASH_GAP, content=FormattedTextControl([("class:text", "")])),
-            slash_menu,
-            Window(height=SLASH_STATUS_GAP, content=FormattedTextControl([("class:text", "")])),
-            Window(height=1, content=FormattedTextControl(self.render_status)),
-            Window(height=STATUS_BOTTOM_MARGIN, content=FormattedTextControl([("class:text", "")])),
-        ])
-        self.output_pane.vertical_scroll = 0
-        layout = Layout(root)
-        layout.focus(self.input_control)
-        return Application(
-            layout=layout,
-            key_bindings=merge_key_bindings([
-                load_key_bindings(),
-                load_mouse_bindings(),
-                output_key_bindings(self),
-                slash_menu_key_bindings(self),
-                input_key_bindings(self),
-            ]),
-            style=pt_style(self.theme_name),
-            full_screen=True,
-            mouse_support=True,
-            erase_when_done=False,
-            refresh_interval=0.4,
-        )
-    def run(self, first=""):
-        pending = first.strip()
-        if not pending:
-            run_startup(self)
-        self.follow_output = False
-        self._keep_at_top = True
-        self.app = self.build_app()
-
-        def boot():
-            if self.output_pane:
-                self.output_pane.vertical_scroll = 0
-            if not pending:
-                self.app.create_background_task(self._intro_animation())
-
-        if pending:
-            self.ui(BANNER, "class:label")
-            self.info(f"model: {self.model_label()}")
-            self.session_info()
-        if pending:
-            self.busy = True
-            try:
-                line = normalize_input(pending)
-                if line and line.lower() not in {"/exit", "exit", "quit"}:
-                    self.route(line)
-            except Exception as e:
-                self.err(str(e))
-            finally:
-                self.busy = False
-        try:
-            self.app.run(pre_run=boot)
-        finally:
-            sys.stdout.write("\033[?25h\033[0m")
-            sys.stdout.flush()
     def route(self, raw):
         if not raw.startswith("/"):
             return self.send(raw)
@@ -1965,13 +2448,25 @@ class Shell:
         if cmd == "/help": return self.help()
         if cmd == "/skills": return self.skills()
         if cmd == "/theme": return self.theme_cmd(rest)
-        if cmd == "/compact": return self.toggle_compact(rest)
+        if cmd == "/compact": return self.compact_transcript()
+        if cmd == "/side": return self.side_cmd(rest)
+        if cmd == "/plan": return self.plan_cmd(rest)
+        if cmd == "/goal": return self.goal_cmd(rest)
+        if cmd in {"/grill-me", "/grill"}:
+            if cmd == "/grill" and rest.lower().startswith("me"):
+                rest = rest[2:].strip()
+            return self.grill_me_cmd(rest)
+        if cmd == "/diff": return self.diff_cmd(rest)
+        if cmd == "/init": return self.init_cmd(rest)
+        if cmd == "/review": return self.review_cmd(rest)
+        if cmd == "/yeet": return self.yeet_cmd(rest)
+        if cmd in {"/exit", "/quit"}: return self.exit_cmd()
         if cmd == "/model":
             return self.set_model(rest)
         if cmd == "/clear":
-            self.history.clear()
+            self._clear_chat_ui()
             self.refresh_status()
-            return self.info("history cleared")
+            return self.info("chat view cleared — context memory retained")
         if cmd == "/attach":
             if rest:
                 return self.attach(rest)
@@ -1984,33 +2479,23 @@ class Shell:
         if cmd == "/system": return self.set_system(rest)
         if cmd == "/mcp": return self.mcp_cmd(rest)
         if cmd == "/cache": return self.cache_cmd(rest)
+        if cmd == "/sessions": return self.sessions_cmd()
+        if cmd == "/rename": return self.rename_cmd(rest)
+        if cmd[1:] in SKILLS:
+            name = cmd[1:]
+            if rest:
+                return self.send(SKILLS.get(name, "") + rest)
+            return self.schedule_ask_text(name)
         if cmd.startswith("/skill:"):
-            name = cmd.split(":", 1)[1]
+            name = SKILL_ALIASES.get(cmd.split(":", 1)[1], cmd.split(":", 1)[1])
             if rest:
                 return self.send(SKILLS.get(name, "") + rest)
             return self.schedule_ask_text(name)
         return self.send(raw)
     def schedule_ask_text(self, skill_name):
-        if self.app:
-            self.app.create_background_task(self._ask_text_task(skill_name))
-        else:
-            try:
-                prompt = input(f"Prompt for {skill_name}: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                prompt = ""
-            self.send(SKILLS.get(skill_name, "") + prompt)
-    async def _ask_text_task(self, skill_name):
-        def ask():
-            try:
-                return input(f"Prompt for {skill_name}: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return ""
-        try:
-            prompt = await run_in_terminal(ask, in_executor=True)
-        except Exception as e:
-            self.warn(str(e))
-            return
+        prompt = ""
+        if self.ui_delegate:
+            prompt = self.ui_delegate.ask_text(f"Skill: {skill_name}", f"Prompt for {skill_name}:")
         self.send(SKILLS.get(skill_name, "") + prompt)
     def attach(self, path):
         raw = (path or "").strip().strip('"').strip("'")
@@ -2040,9 +2525,6 @@ class Shell:
                 pass
             return self.err(f"could not read file: {p.name} — file may be corrupted, encrypted, or empty")
         self.attachments.append(att); self.aid += 1
-        if p.is_dir():
-            self.workspace_name = p.name
-            self.mode = "workspace"
         self.refresh_status()
         if p.is_dir():
             line = f"Attached #{att.id}  {p.name}/  ·  {att.files} files  ·  {att.chars:,} chars"
@@ -2051,8 +2533,8 @@ class Shell:
         self._ensure_ui()
         with self._frag_lock:
             self.blocks.append(UiBlock("attach", line))
-        if self.app:
-            self.app.invalidate()
+        if self.ui_delegate:
+            self.ui_delegate.requestRefresh()
     def drop(self, target):
         if not target or target == "all":
             self.attachments.clear()
@@ -2103,8 +2585,6 @@ class Shell:
                 "model": self.model,
                 "model_label": self.model_label(),
                 "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "mode": self.mode,
-                "workspace": self.workspace_name,
                 "messages": messages,
             }, indent=2, ensure_ascii=False)
         lines = [
@@ -2112,8 +2592,6 @@ class Shell:
             f"model: {self.model_label()}\n",
             f"exported: {time.strftime('%Y-%m-%d %H:%M:%S')}\n",
         ]
-        if self.mode == "workspace" and self.workspace_name:
-            lines.append(f"workspace: {self.workspace_name}\n")
         for msg in messages:
             role = msg.get("role", "?")
             label = {"user": "You", "assistant": "Assistant"}.get(role, role.title())
@@ -2154,31 +2632,52 @@ class Shell:
     def mcp_cmd(self, rest):
         if not self.mcp.servers:
             return self.warn(f"mcp unavailable — export {COMPOSIO_KEY} or add {MCP_FILE}")
+        verbose = rest.lower() in {"verbose", "v", "full"}
         tools = [t for t in self.mcp.tools() if t.get("name") != "ERROR"]
         if not tools:
             return self.warn("no mcp tools available")
+        self.ui("MCP servers", "class:label")
+        for name, srv in self.mcp.servers.items():
+            cfg = srv.cfg if hasattr(srv, "cfg") else {}
+            kind = "stdio" if "command" in cfg else "http"
+            line = f"  {name}  [{kind}]"
+            if verbose:
+                if "url" in cfg:
+                    line += f"  url={cfg.get('url')}"
+                if "command" in cfg:
+                    line += f"  cmd={' '.join([cfg.get('command', '')] + cfg.get('args', []))}"
+            self.ui(line)
         self.ui("MCP tools", "class:label")
         for x in tools:
-            self.ui(f"  {x['server']}.{x['name']:<28} {str(x.get('description') or '')[:64]}")
+            desc = str(x.get("description") or "")
+            if verbose:
+                schema = x.get("inputSchema") or {}
+                props = list((schema.get("properties") or {}).keys())[:8]
+                extra = f"  schema={props}" if props else ""
+                self.ui(f"  {x['server']}.{x['name']:<28} {desc[:120]}{extra}")
+            else:
+                self.ui(f"  {x['server']}.{x['name']:<28} {desc[:64]}")
+        if verbose:
+            self.info(f"mcp enabled={self.mcp.enabled}  servers={len(self.mcp.servers)}  tools={len(tools)}")
     def cache_cmd(self, rest):
         rest = (rest or "").strip()
         if rest == "clear":
             self.cache.clear()
             return self.info("cache cleared")
         if rest in ("list", "ls"):
-            ws = self.cache.workspaces()
+            ws = self.cache.cached_folders()
             if not ws:
-                return self.info("no cached workspaces")
-            self.ui("Cached workspaces", "class:label")
+                return self.info("no cached folders")
+            self.ui("Cached folders", "class:label")
             for w in ws[:30]:
                 age = time.time() - w["mtime"]
                 age_s = f"{int(age)}s" if age < 60 else f"{int(age/60)}m" if age < 3600 else f"{int(age/3600)}h" if age < 86400 else f"{int(age/86400)}d"
                 self.ui(f"  {w['name']}  ·  {w['files']} files  ·  {w['chars']:,} chars  ·  {age_s} ago")
             return
         n, b = self.cache.stats()
-        ws_n = len(self.cache.workspaces())
-        self.info(f"cache: {n} entries ({ws_n} workspaces), {b:,} bytes at {CACHE_DIR}  ·  /cache list  /cache clear")
-    def _auto_refresh_workspaces(self):
+        ws_n = len(self.cache.cached_folders())
+        self.info(f"cache: {n} entries ({ws_n} folders), {b:,} bytes at {CACHE_DIR}  ·  /cache list  /cache clear")
+    def _auto_refresh_attachments(self):
         if not self.attachments: return
         for i, a in enumerate(self.attachments):
             if a.kind != "text" or not a.path or not a.path.is_dir(): continue
@@ -2197,55 +2696,84 @@ class Shell:
     def help(self):
         self.ui("Commands", "class:label")
         for line in [
-            "/model [name|#]  switch model (or /model alone to pick)",
-            "/attach [path]     pick file or folder, then choose in Finder",
+            "/model [name] [variant]  switch model + reasoning",
+            "/model custom <id> [variant]  use any OpenRouter model id",
+            "/compact            summarize transcript and replace chat context",
+            "/side <question>     ask a side question (not added to main history)",
+            "/plan               toggle planning mode",
+            "/goal <objective>     start relentless execution + timer",
+            "/goal pause|resume|clear|show  control active goal",
+            "/grill-me (/grill)  immediately stress-test the current plan",
+            "/diff               show live git diff (staged, unstaged, untracked)",
+            "/init [force]       scaffold AGENTS.md in attached folder or home",
+            "/review [focus]     full project review from attachments",
+            "/yeet [message]     stage, commit, push, and open a GitHub PR",
+            "/attach [path]      attach file or folder",
             "/                slash menu — ↑↓ navigate · Tab or Enter to complete",
             "Enter              send  ·  Ctrl+J new line",
-            "PgUp/PgDn          scroll output  ·  Ctrl+G jump to latest",
-            "/drop [#|all]     remove attachment(s)",
-            "/context          list attachments",
-            "/skills           list skill shortcuts",
-            "/skill:<name>     run a skill prompt",
-            "/system [text]    view or set system prompt",
-            "/save [path]      save last reply to file",
-            "/copy             copy last reply to clipboard",
-            "/export            download chat to ~/Downloads",
-            "/export json       download chat as json",
-            "/mcp               list connected MCP tools",
-            "/cache [list|clear] cache stats, list workspaces, or clear",
-            "/theme [dark|light]  switch theme",
-            "/compact [on|off] less UI + smaller API context",
-            "/clear            clear chat history",
-            "/exit             quit",
+            "Esc                stop generation while streaming",
+            "/debug /build ...   direct skill commands",
+            "/mcp [verbose]      list MCP servers/tools",
+            "/sessions            list saved sessions (resume via HackClub AI → File → Resume Session)",
+            "/clear              clear chat view (keeps compact summary/context)",
+            "/exit (/quit)       quit",
         ]:
             self.ui(f"  {line}")
     def skills(self):
         self.ui("Skills", "class:label")
         for k, v in SKILLS.items():
-            self.ui(f"  /skill:{k:<10} {v.split('.')[0]}")
+            self.ui(f"  /{k:<10} {v.split('.')[0]}")
     def is_anthropic_model(self, model=None):
         m = (model or self.model or "").lower()
         return "claude" in m or "anthropic" in m
     def messages(self, prompt, model=None):
-        system = self.system
+        # Input-token minimization:
+        #  - Only send the (large) filesystem instructions when the turn actually needs them.
+        #  - For Anthropic models, mark the stable prefix (system, attached context, summary,
+        #    and the prior-turn history) with cache_control so it bills as cheap cached input
+        #    instead of full-price input tokens on every turn.
+        anthropic = self.is_anthropic_model(model)
+        system = self.system + self.mode_prompt()
+        if user_wants_fs(prompt, self):
+            system += EXECUTION_RULES + local_fs_prompt(self.write_root())
         if self.mcp.enabled and self.mcp.servers and user_wants_mcp(prompt):
             system += mcp_integration_prompt(self.mcp, prompt)
+
         msgs = [{"role": "system", "content": system}]
+
         ctx_limit = self.max_ctx_limit()
         texts = [str(a.content) for a in self.attachments if a.kind == "text"]
         images = [{"type": "image_url", "image_url": {"url": f"data:{a.content['mime']};base64,{a.content['data']}"}} for a in self.attachments if a.kind == "image"]
         if texts:
-            workspace_text = "\n\n".join(texts)[:ctx_limit]
+            context_text = "\n\n".join(texts)[:ctx_limit]
             intro = ("The following attached context is stable across turns — it is the same on every turn until "
                      "files change. Refer back to it as needed; do not ask the user to re-paste it.\n\n")
-            ws_payload = intro + workspace_text
-            if self.is_anthropic_model(model):
-                ws_content = [{"type": "text", "text": ws_payload, "cache_control": {"type": "ephemeral"}}]
+            ctx_payload = intro + context_text
+            if anthropic:
+                ws_content = [{"type": "text", "text": ctx_payload, "cache_control": {"type": "ephemeral"}}]
                 msgs.append({"role": "user", "content": ws_content})
             else:
-                msgs.append({"role": "user", "content": ws_payload})
+                msgs.append({"role": "user", "content": ctx_payload})
             msgs.append({"role": "assistant", "content": "Acknowledged. I'll use the attached files as context for this conversation."})
-        msgs += self.history[-self.max_history_msgs():]
+        if self.transcript_summary:
+            summary_text = "Compacted conversation summary from earlier in this session:\n\n" + self.transcript_summary
+            if anthropic:
+                msgs.append({"role": "user", "content": [
+                    {"type": "text", "text": summary_text, "cache_control": {"type": "ephemeral"}}]})
+            else:
+                msgs.append({"role": "user", "content": summary_text})
+            msgs.append({"role": "assistant", "content": "Acknowledged. I'll treat that summary as prior session context."})
+
+        hist = self.history_window()
+        if anthropic and hist:
+            # Cache everything up to and including the previous turn; only the new prompt is uncached.
+            cached_last = dict(hist[-1])
+            if isinstance(cached_last.get("content"), str):
+                cached_last["content"] = [{"type": "text", "text": cached_last["content"],
+                                           "cache_control": {"type": "ephemeral"}}]
+                hist = hist[:-1] + [cached_last]
+        msgs += hist
+
         if images:
             msgs.append({"role": "user", "content": [{"type": "text", "text": prompt}, *images]})
         else:
@@ -2255,9 +2783,10 @@ class Shell:
         name = (rest or "").strip().lower()
         if not name:
             return self.ok(f"theme: {self.theme_name} (dark, light)")
-        return self.apply_theme(name)
+        return self.ui_delegately_theme(name)
     def send(self, prompt):
         try:
+            self._clear_stop()
             self._keep_at_top = False
             self.follow_output = True
             self.usage = Usage()
@@ -2269,11 +2798,41 @@ class Shell:
             mcp_calls = 0
             nudges = 0
             self.show_assistant_start()
-            for _ in range(MCP_MAX_STEPS):
+            fs_calls = 0
+            fs_nudges = 0
+            fs_task = user_wants_fs(prompt, self)
+            for _ in range(FS_MAX_STEPS):
+                if self._stopped():
+                    break
                 out, think = self.stream_text(msgs)
-                combined = out + ("\n" + think if think else "")
-                call = parse_mcp_call(combined)
+                if self._stopped():
+                    final = out
+                    break
+                fs_call = parse_fs_call(out)
+                if fs_call:
+                    if self._stopped():
+                        final = out
+                        break
+                    fs_calls += 1
+                    self._hide_fs_json_block()
+                    label = fs_call.get("path") or fs_call.get("command", "file")
+                    self.info(f"fs: {label} ...")
+                    try:
+                        note = self.execute_fs_call(fs_call)
+                        self.ok(note.split("\n")[0][:120])
+                    except Exception as e:
+                        note = "FS error: " + str(e)
+                        self.err(str(e))
+                    msgs += [
+                        {"role": "assistant", "content": out},
+                        {"role": "user", "content": note + "\n\n" + fs_continue_message()},
+                    ]
+                    continue
+                call = parse_mcp_call(out)
                 if call and self.mcp.enabled:
+                    if self._stopped():
+                        final = out
+                        break
                     nudges = 0
                     self._hide_mcp_json_block()
                     tool_label = call["tool"]
@@ -2289,32 +2848,46 @@ class Shell:
                         note = "MCP error for " + tool_label + ": " + str(e)
                     mcp_calls += 1
                     msgs += [
-                        {"role": "assistant", "content": combined},
+                        {"role": "assistant", "content": out},
                         {"role": "user", "content": note + "\n\n" + mcp_continue_message()},
                     ]
                     continue
-                if mcp_task and nudges < MCP_MAX_NUDGES and combined.strip():
+                if fs_task and fs_nudges < FS_MAX_NUDGES and looks_like_code_without_fs(out):
+                    fs_nudges += 1
+                    msgs += [
+                        {"role": "assistant", "content": out},
+                        {"role": "user", "content": fs_nudge_message(fs_nudges)},
+                    ]
+                    continue
+                if mcp_task and nudges < MCP_MAX_NUDGES and out.strip():
                     nudges += 1
                     self._hide_mcp_json_block()
                     msgs += [
-                        {"role": "assistant", "content": combined},
+                        {"role": "assistant", "content": out},
                         {"role": "user", "content": mcp_nudge_message(nudges)},
                     ]
                     continue
                 final = out
                 break
-            if mcp_task and mcp_calls == 0:
+            if self._stopped():
+                self.warn("generation stopped")
+            if mcp_task and mcp_calls == 0 and not self._stopped():
                 self.warn("no tools were executed — the reply may not have actually done anything")
             if final.strip():
                 self._fill_usage_fallback(prompt, msgs, final)
                 self.last = final
-                self.history += [{"role": "user", "content": prompt}, {"role": "assistant", "content": final}]
-                self.history = self.history[-self.max_history_msgs():]
+                if self.session_mode != "side":
+                    self.history += [{"role": "user", "content": prompt}, {"role": "assistant", "content": final}]
+                    self.history = self.history[-self.max_history_msgs():]
                 self.session_usage.input += self.usage.input
                 self.session_usage.output += self.usage.output
                 self.session_usage.cached += self.usage.cached
-                self._auto_refresh_workspaces()
+                self._auto_refresh_attachments()
+                self._last_activity = time.strftime("%Y-%m-%dT%H:%M:%S")
+                self.persist_session()
                 self.refresh_status(invalidate=True)
+                if not self._stopped():
+                    self.auto_compact_if_needed()
         except Exception as e:
             self.err(str(e))
     def stream_text(self, msgs, model=None, _is_fallback=False):
@@ -2326,17 +2899,21 @@ class Shell:
         out_i = None
         with self._frag_lock:
             spin_i = len(self.blocks)
-            label = "thinking" if not _is_fallback else f"thinking (fallback: {active_model})"
-            self.blocks.append(UiBlock("spin", SPINNER[0] + " " + label, "class:dim"))
+            base = "Thinking" if not _is_fallback else f"Thinking · fallback {active_model}"
+            self.blocks.append(UiBlock("spin", SPINNER_BAR[0] + "  " + base, "class:spin"))
         self.follow_latest(force=True)
         stop = threading.Event()
         def spin():
             i = 0
-            while not stop.wait(0.08):
+            # Switch label to "Writing" once response text has started streaming.
+            while not stop.wait(0.07):
                 with self._frag_lock:
-                    if spin_i >= len(self.blocks) or self.blocks[spin_i].kind != "spin":
+                    if spin_i is None or spin_i >= len(self.blocks) or self.blocks[spin_i].kind != "spin":
                         break
-                    self.blocks[spin_i] = UiBlock("spin", SPINNER[i % len(SPINNER)] + " " + label, "class:dim")
+                    verb = "Writing" if out_i is not None else base
+                    dots = SPINNER_DOTS[(i // 4) % len(SPINNER_DOTS)]
+                    glyph = SPINNER_BAR[i % len(SPINNER_BAR)]
+                    self.blocks[spin_i] = UiBlock("spin", f"{glyph}  {verb}{dots}", "class:spin")
                 i += 1
         worker = threading.Thread(target=spin, daemon=True)
         worker.start()
@@ -2349,43 +2926,49 @@ class Shell:
                     self.blocks.pop(spin_i)
             spin_i = None
         try:
-            for chunk in self.client.chat.send(model=active_model, messages=msgs, stream=True):
+            for chunk in self.client.chat.send(
+                model=active_model,
+                messages=msgs,
+                reasoning=self.reasoning_request(active_model),
+                stream=True,
+            ):
+                if self._stopped():
+                    break
                 self.read_usage(chunk, invalidate=False)
                 for kind, piece in self.delta_parts(chunk):
                     if kind == "reasoning":
-                        if self.compact:
-                            think += piece
-                            continue
-                        if think_i is None:
-                            end_spin()
-                            with self._frag_lock:
-                                think_i = len(self.blocks)
-                                self.blocks.append(UiBlock("think", ""))
                         think += piece
-                        with self._frag_lock:
-                            self.blocks[think_i].text = think
-                        self.touch_body(scroll_bottom=True)
-                    else:
-                        if out_i is None:
-                            end_spin()
+                        if not self.compact:
+                            # Stream reasoning live, inserted just above the working
+                            # indicator so the spinner stays pinned at the bottom.
                             with self._frag_lock:
-                                out_i = len(self.blocks)
-                                self.blocks.append(UiBlock("md", ""))
-                        out += piece
+                                if think_i is None:
+                                    think_i = spin_i if spin_i is not None else len(self.blocks)
+                                    self.blocks.insert(think_i, UiBlock("think_live", think))
+                                    if spin_i is not None:
+                                        spin_i += 1
+                                elif think_i < len(self.blocks):
+                                    self.blocks[think_i].text = think
+                            self.touch_body(scroll_bottom=True)
+                        continue
+                    if out_i is None:
+                        end_spin()
                         with self._frag_lock:
-                            self.blocks[out_i].text = out
+                            out_i = len(self.blocks)
+                            self.blocks.append(UiBlock("stream", ""))
+                    out += piece
+                    with self._frag_lock:
+                        self.blocks[out_i].text = out
                     self.touch_body(scroll_bottom=True)
             self.refresh_status(invalidate=True)
-            end_spin()
-            with self._frag_lock:
-                if think_i is not None and think.strip():
-                    self.blocks[think_i].text = think.rstrip() + "\n"
-                if out_i is not None and out.strip():
-                    self.blocks[out_i].text = out.rstrip() + "\n"
-                elif out_i is None and think_i is None and spin_i is not None and spin_i < len(self.blocks):
-                    self.blocks[spin_i] = UiBlock("spin", "thinking", "class:dim")
+            self._finalize_stream_blocks(out, think, out_i, think_i, spin_i, end_spin)
+            if self._stopped():
+                return out, think
         except Exception as e:
             end_spin()
+            if self._stopped():
+                self._finalize_stream_blocks(out, think, out_i, think_i, spin_i, lambda: None)
+                return out, think
             with self._frag_lock:
                 if out_i is not None and out_i < len(self.blocks):
                     self.blocks.pop(out_i)
@@ -2394,7 +2977,7 @@ class Shell:
                     self.blocks.pop(think_i)
                     think_i = None
             reason = self._classify_error(e)
-            if not _is_fallback and active_model != FALLBACK_MODEL and FALLBACK_MODEL:
+            if not _is_fallback and active_model != FALLBACK_MODEL and FALLBACK_MODEL and not self._stopped():
                 self.warn(f"primary model failed ({reason}: {str(e)[:160]}) — retrying with fallback {FALLBACK_MODEL}")
                 self.stream_i = None
                 return self.stream_text(msgs, model=FALLBACK_MODEL, _is_fallback=True)
@@ -2412,11 +2995,19 @@ class Shell:
         if "5" in s[:4] and ("502" in s or "503" in s or "504" in s or "500" in s): return "upstream server error"
         if "connection" in s or "network" in s: return "network error"
         return "error"
+    def _hide_fs_json_block(self):
+        with self._frag_lock:
+            for i in range(len(self.blocks) - 1, -1, -1):
+                b = self.blocks[i]
+                if b.kind in {"md", "text", "think", "stream"} and parse_fs_call(b.text):
+                    self.blocks[i] = UiBlock(b.kind, "")
+                    return
+
     def _hide_mcp_json_block(self):
         with self._frag_lock:
             for i in range(len(self.blocks) - 1, -1, -1):
                 b = self.blocks[i]
-                if b.kind in {"md", "text", "think"} and parse_mcp_call(b.text):
+                if b.kind in {"md", "text", "think", "stream"} and parse_mcp_call(b.text):
                     self.blocks[i] = UiBlock(b.kind, "")
                     return
     def delta_parts(self, chunk):
@@ -2458,9 +3049,12 @@ class Shell:
             out_tok = getattr(u, "completion_tokens", None) or getattr(u, "output_tokens", None) or 0
             details = getattr(u, "prompt_tokens_details", None)
             cached = getattr(details, "cached_tokens", 0) if details else (getattr(u, "cache_read_input_tokens", 0) or 0)
+        # prompt_tokens (OpenAI-compatible) includes cached reads; report only the
+        # non-cached portion as "input" so prompt-cache savings are reflected in the metric.
+        noncached = max(0, int(inp) - int(cached)) if inp else 0
         changed = False
-        if inp and int(inp) != self.usage.input:
-            self.usage.input = int(inp)
+        if inp and noncached != self.usage.input:
+            self.usage.input = noncached
             changed = True
         if out_tok and int(out_tok) != self.usage.output:
             self.usage.output = int(out_tok)
@@ -2472,12 +3066,7 @@ class Shell:
             self.refresh_status(invalidate=invalidate)
 
 if __name__ == "__main__":
-    try:
-        Shell().run(" ".join(sys.argv[1:]))
-    except KeyboardInterrupt:
-        pass
-    except SystemExit:
-        raise
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    if sys.platform != "darwin":
+        raise SystemExit("HackClub AI is a macOS desktop app. Run: python hackclub_app.py")
+    from hackclub_app import main
+    main()
