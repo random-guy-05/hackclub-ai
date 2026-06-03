@@ -57,8 +57,7 @@ Pick **one** method below.
 Best if you want the fastest install path with the fewest manual steps.
 
 ```bash
-brew tap random-guy-05/tap
-brew install --cask hackclub-ai
+brew install --cask random-guy-05/tap/hackclub-ai
 ```
 
 What this cask does:
@@ -68,7 +67,7 @@ What this cask does:
 - removes the quarantine attribute automatically
 - launches the app automatically after install
 
-You can also do it in one shell line:
+If you prefer to add the tap first, this works too:
 
 ```bash
 brew tap random-guy-05/tap && brew install --cask hackclub-ai
@@ -400,7 +399,7 @@ python3 scripts/generate_homebrew_cask.py
 2. Run `./scripts/build_macos_app.sh`.
 3. Upload `dist/HackClub-AI.dmg` to GitHub Releases under tag `v<version>`.
 4. Commit the updated `Casks/hackclub-ai.rb`.
-5. Copy `Casks/hackclub-ai.rb` into the `homebrew-tap` repository so users can run `brew tap random-guy-05/tap && brew install --cask hackclub-ai`.
+5. Copy `Casks/hackclub-ai.rb` into the `homebrew-tap` repository so users can run `brew install --cask random-guy-05/tap/hackclub-ai`.
 
 ---
 
