@@ -1987,7 +1987,7 @@ class SettingsController(NSObject):
         content.layer().setBackgroundColor_(rgb_color(THEME["dark"]["window"]).CGColor())
 
         title = make_label("Settings", 22, AppKit.NSFontWeightBold, NSColor.labelColor())
-        hint = make_label("Keys are stored locally at ~/.hackclub-ai-shell/config.json", 12, 0, NSColor.secondaryLabelColor())
+        hint = make_label("Keys are stored locally at ~/.hackclub-ai/config.json", 12, 0, NSColor.secondaryLabelColor())
 
         hc_label = make_label("Hack Club API Key", 13, AppKit.NSFontWeightSemibold, NSColor.labelColor())
         self.hc_field = NSSecureTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 460, 32))

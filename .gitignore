@@ -7,7 +7,8 @@ __pycache__/
 .venv-test/
 .venv-build/
 build/
-dist/
+dist/*
+!dist/HackClub-AI.dmg
 assets/icon.iconset/
 venv/
 
@@ -16,6 +17,7 @@ venv/
 *.env
 mcp.json
 
+.hackclub-ai/
 .hackclub-ai-shell/
 
 .DS_Store

@@ -2,13 +2,15 @@
 
 # HackClub AI
 
-**A native macOS desktop chat client for the Hack Club AI proxy.**
+**A native macOS desktop chat client for the [Hack Club AI](https://ai.hackclub.com) proxy.**
 
 Free access to frontier models — GPT, Claude, Gemini — with attachments, skills, MCP integrations, session history, and a polished desktop UI.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](#requirements)
+
+**Repository:** [github.com/random-guy-05/hackclub-ai](https://github.com/random-guy-05/hackclub-ai)
 
 </div>
 
@@ -21,143 +23,338 @@ Free access to frontier models — GPT, Claude, Gemini — with attachments, ski
 
 ---
 
-## Features
+## Table of contents
 
-- **Native macOS app** — real `.app` bundle with Dock icon, not a terminal TUI
-- **Instant chat** — no workspace or project-folder setup on launch
-- **In-app settings** — API keys saved locally; no shell `export` required
-- **Session sidebar** — search, resume, rename, and clear saved chats
-- **Token-efficient context** — prompt caching, conditional system prompts, budgeted history, and auto-compaction for long conversations
-- **Inline reasoning** — live thinking stream with a styled reasoning panel and loading animation
-- **Attachments** — files and folders via menu or `/attach`
-- **Slash commands** — models, skills, export, MCP, goals, review, and more
-- **Dark / light themes** — switch in Settings or with `/theme`
+1. [Requirements](#requirements)
+2. [Installation](#installation)
+3. [First launch](#first-launch)
+4. [Daily usage](#daily-usage)
+5. [Slash commands](#slash-commands)
+6. [Settings & configuration](#settings--configuration)
+7. [Troubleshooting](#troubleshooting)
+8. [Development](#development)
+9. [Project layout](#project-layout)
 
 ---
 
 ## Requirements
 
-| | |
+| Requirement | Details |
 |---|---|
-| **Operating system** | macOS 12+ |
-| **Python** | 3.10 or newer (for development; the built `.app` bundles its own runtime) |
-| **Hack Club AI key** | Free at <https://ai.hackclub.com> |
-| **Composio API key** | Optional — for MCP integrations |
+| **macOS** | 12 Monterey or later |
+| **Hack Club AI API key** | Free at [ai.hackclub.com](https://ai.hackclub.com) |
+| **Python 3.10+** | Only needed if you run from source or build the app yourself |
+| **Composio API key** | Optional — enables MCP tool integrations |
 
 ---
 
 ## Installation
 
-### Option A — Build the macOS app (recommended)
+Pick **one** method below.
+
+### Method 1 — Install from DMG (easiest)
+
+Best if you just want the app and do not need to touch the source code.
+
+1. **Get a DMG**
+   - Download a release from [GitHub Releases](https://github.com/random-guy-05/hackclub-ai/releases), **or**
+   - Build one locally (see [Method 2](#method-2--build-the-app-from-source)).
+
+2. **Open the DMG**  
+   Double-click `HackClub-AI.dmg`.
+
+3. **Drag to Applications**  
+   Drag **HackClub AI** onto the **Applications** folder shortcut in the window.
+
+4. **Launch the app**
+   - Open **Applications** and double-click **HackClub AI**, or
+   - Press `⌘Space`, type `HackClub AI`, and press Return.
+
+5. **First launch security (if macOS blocks the app)**  
+   If you see “cannot be opened because the developer cannot be verified”:
+   - Open **System Settings → Privacy & Security**
+   - Click **Open Anyway** next to the HackClub AI message, then confirm.
+
+   Alternatively, right-click the app in Finder → **Open** → **Open** again.
+
+---
+
+### Method 2 — Build the app from source
+
+Best if you are developing, want the latest code, or need to create a DMG to share.
 
 ```bash
-git clone https://github.com/random-guy-05/hackclub-cli.git ~/Documents/hackclub-cli
-cd ~/Documents/hackclub-cli
+# 1. Clone the repo
+git clone https://github.com/random-guy-05/hackclub-ai.git ~/Documents/hackclub-ai
+cd ~/Documents/hackclub-ai
+
+# 2. Build the app bundle, install it, and create a DMG
 chmod +x scripts/build_macos_app.sh
 ./scripts/build_macos_app.sh
 ```
 
-This creates a self-contained app at **`~/Applications/HackClub AI.app`** with its own Python environment and icon. Launch from **Applications**, **Spotlight**, or the Dock.
+**What this produces:**
 
-On first launch you'll be prompted for your **Hack Club API Key**. It is stored at `~/.hackclub-ai-shell/config.json`.
+| Output | Location |
+|---|---|
+| Installed app | `~/Applications/HackClub AI.app` |
+| Distributable DMG | `dist/HackClub-AI.dmg` |
+| Build artifacts (ignored by git) | `build/` |
 
-### Option B — Run from source
+The built app bundles its own Python runtime — you do not need a separate venv to run it.
+
+**Launch after build:**
 
 ```bash
-git clone https://github.com/random-guy-05/hackclub-cli.git ~/Documents/hackclub-cli
-cd ~/Documents/hackclub-cli
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python hackclub_app.py
+open ~/Applications/HackClub\ AI.app
 ```
 
 ---
 
-## Usage
+### Method 3 — Run from source (development)
 
-### Keyboard & composer
+Use this when you are actively editing code and want instant changes without rebuilding the `.app`.
 
-| Key | Action |
-|---|---|
-| `Return` | Send message |
-| `Shift-Return` | New line |
-| `/` | Slash command menu |
-| `⌘,` | Settings |
+```bash
+# 1. Clone the repo
+git clone https://github.com/random-guy-05/hackclub-ai.git ~/Documents/hackclub-ai
+cd ~/Documents/hackclub-ai
 
-The composer footer shows **context usage** and **input/output token counts** (`ctx`, `in`, `out`).
+# 2. Create a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
 
-### Chat management
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Launch the UI
+python hackclub_app.py
+```
+
+**Optional launch flags:**
+
+```bash
+python hackclub_app.py "explain quicksort"     # start with an initial prompt
+python hackclub_app.py --resume                  # pick a saved session on launch
+python hackclub_app.py --resume SESSION_ID       # resume a specific session
+```
+
+---
+
+## First launch
+
+1. **HackClub AI opens** with an empty chat or welcome screen.
+
+2. **Enter your API key** when prompted.  
+   Get a free key at [ai.hackclub.com](https://ai.hackclub.com).
+
+3. **The key is saved locally** at:
+
+   ```
+   ~/.hackclub-ai/config.json
+   ```
+
+   You can change it anytime in **Settings** (`⌘,`).
+
+4. **Start chatting** — type a message and press Return.
+
+> **Upgrading from an older install?**  
+> If you previously used `.hackclub-ai-shell/`, the app automatically migrates your config and sessions to `~/.hackclub-ai/` on first launch.
+
+---
+
+## Daily usage
+
+### Sending messages
 
 | Action | How |
 |---|---|
-| **New chat** | Sidebar **New Chat** button |
-| **Rename** | Top-bar **Rename**, double-click a sidebar chat, right-click → **Rename…**, or `/rename <title>` |
-| **Clear all chats** | Sidebar **Clear** (with confirmation) |
-| **Search chats** | Sidebar search field |
-| **Resume session** | Click a chat in the sidebar, or **File → Resume Session…** |
+| Send | `Return` |
+| New line | `Shift-Return` |
+| Open slash commands | Type `/` in the composer |
+| Open settings | `⌘,` or click **Settings** in the top bar |
 
-Sessions are saved automatically to `~/.hackclub-ai-shell/sessions/`.
+The composer footer shows **context usage** and token counts (`ctx`, `in`, `out`).
+
+### Managing chats
+
+| Action | How |
+|---|---|
+| **New chat** | Sidebar **New Chat** button, or **File → New Session** (`⌘N`) |
+| **Resume a chat** | Click a session in the sidebar, or **File → Resume Session…** (`⌘R`) |
+| **Rename a chat** | Top-bar **Rename**, double-click a sidebar item, right-click → **Rename…**, or `/rename <title>` |
+| **Search chats** | Sidebar search field |
+| **Clear all chats** | Sidebar **Clear** (confirmation required) |
+| **Export chat** | **File → Export Chat…** (`⌘E`) or `/export` |
+
+Sessions auto-save to `~/.hackclub-ai/sessions/`.
 
 ### Attachments
 
-Use **Attach** in the top bar, **File → Attach File…** / **Attach Folder…**, or `/attach` in chat. There is no project workspace binding — attach context only when you need it.
+Attach files or folders when you want the model to read project context:
 
-### Slash commands
+| Action | How |
+|---|---|
+| Attach file | Top-bar **Attach**, **File → Attach File…** (`⌘O`), or `/attach` |
+| Attach folder | **File → Attach Folder…** (`⇧⌘O`) |
+| List attachments | `/context` |
+| Remove attachments | `/drop` |
+
+There is no fixed workspace — attach context only when you need it.
+
+### Menu bar reference
+
+| Menu | Items |
+|---|---|
+| **HackClub AI** | About, Settings (`⌘,`), Quit (`⌘Q`) |
+| **File** | Attach File (`⌘O`), Attach Folder (`⇧⌘O`), Export Chat (`⌘E`), New Session (`⌘N`), Resume Session (`⌘R`) |
+| **View** | Dark Theme, Light Theme, Toggle Compact |
+
+### Themes
+
+- Switch in **Settings**, **View** menu, or with `/theme`.
+- **Compact message view** — denser transcript; toggle in Settings or **View → Toggle Compact**.
+
+---
+
+## Slash commands
+
+Type `/` in the composer to open the command menu, or enter a command directly.
 
 | Command | Description |
 |---|---|
 | `/help` | List all commands |
 | `/model` | Switch model and reasoning effort |
 | `/rename` | Rename the current chat |
+| `/clear` | Clear the current chat history |
 | `/attach` | Attach a file or folder |
-| `/export` | Export chat as markdown or JSON |
+| `/drop` | Remove attachment(s) |
+| `/context` | List attached files and folders |
+| `/export` | Export chat as Markdown or JSON |
 | `/compact` | Summarize and compress transcript context |
-| `/context` | List attached files |
 | `/skills` | Built-in prompt shortcuts |
-| `/goal` | Relentless execution mode |
+| `/goal` | Relentless execution mode for an objective |
+| `/plan` | Toggle planning mode |
 | `/review` | Full project review from attachments |
+| `/grill-me` | Stress-test the current plan |
 | `/mcp` | MCP tool status |
+| `/cache` | Cache stats or clear cached folders |
 | `/theme` | Switch dark or light theme |
+| `/side` | Ask a side question without polluting main history |
+| `/save` | Save last reply to a file |
+| `/copy` | Copy last reply to clipboard |
+| `/system` | View or set the system prompt |
+| `/diff` | Show live git diff |
+| `/init` | Scaffold AGENTS.md in an attached folder |
+| `/yeet` | Stage, commit, push, and open a GitHub PR |
+| `/sessions` | List saved chat sessions |
+| `/exit` | Quit HackClub AI |
 
-Launch with an initial prompt or resume a session:
-
-```bash
-python hackclub_app.py "explain quicksort"
-python hackclub_app.py --resume
-python hackclub_app.py --resume SESSION_ID
-```
-
----
-
-## Settings
-
-Open **Settings** from the top bar or menu. Configure:
-
-- **Hack Club API Key** (required)
-- **Composio API Key** (optional, for MCP)
-- **Appearance** — dark / light theme
-- **Compact message view** — denser transcript layout
-
-Keys are stored at `~/.hackclub-ai-shell/config.json`. Preferences at `~/.hackclub-ai-shell/prefs.json`.
+Exported chats are saved to `~/Downloads/hackclub-chat-*.{md,json}`.
 
 ---
 
-## Configuration
+## Settings & configuration
 
-Environment variables (optional overrides):
+### In-app settings
+
+Open **Settings** (`⌘,`):
+
+| Setting | Purpose |
+|---|---|
+| **Hack Club API Key** | Required — powers all chat requests |
+| **Composio API Key** | Optional — MCP integrations |
+| **Appearance** | Dark or light theme |
+| **Compact message view** | Denser transcript layout |
+
+### Local data paths
+
+| Path | Contents |
+|---|---|
+| `~/.hackclub-ai/config.json` | API keys |
+| `~/.hackclub-ai/prefs.json` | Theme and UI preferences |
+| `~/.hackclub-ai/sessions/` | Saved chat sessions |
+| `~/.hackclub-ai/cache/` | Attachment index cache |
+| `~/Library/Logs/HackClub-AI.log` | App error log |
+
+### Environment variables (optional)
+
+These override defaults. The built `.app` reads `HACKCLUB_API_KEY` from config first; env vars are mainly useful when running from source.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `HACKCLUB_API_KEY` | — | Hack Club AI proxy key (also set in-app) |
+| `HACKCLUB_API_KEY` | — | Hack Club AI proxy key |
 | `COMPOSIO_API_KEY` | — | Composio MCP integrations |
 | `HACKCLUB_AI_BASE_URL` | `https://ai.hackclub.com/proxy/v1` | API endpoint |
 | `HC_DEFAULT_MODEL` | `~openai/gpt-mini-latest` | Default model |
 | `HC_MAX_CONTEXT` | `180000` | Max attachment context chars |
-| `HC_HISTORY_BUDGET` | `90000` | Max history chars sent per request |
-| `HC_AUTO_COMPACT_PCT` | `75` | Auto-compact when live context exceeds this % |
-| `HC_AUTO_COMPACT_KEEP` | `6` | Recent turns kept verbatim after auto-compact |
-| `HC_MCP_CONFIG` | `~/mcp.json` | MCP config path |
+| `HC_HISTORY_BUDGET` | `90000` | Max history chars per request |
+| `HC_AUTO_COMPACT_PCT` | `75` | Auto-compact when context exceeds this % |
+| `HC_AUTO_COMPACT_KEEP` | `6` | Recent turns kept after auto-compact |
+| `HC_MCP_CONFIG` | `~/.hackclub-ai/mcp.json` | MCP config path |
+
+---
+
+## Troubleshooting
+
+### App will not open / “damaged” or “unverified developer”
+
+This is normal for apps built locally and not notarized by Apple.
+
+1. Right-click **HackClub AI** in Applications → **Open** → confirm **Open**.
+2. Or use **System Settings → Privacy & Security → Open Anyway**.
+
+### API key errors / “unauthorized”
+
+1. Confirm your key at [ai.hackclub.com](https://ai.hackclub.com).
+2. Open **Settings** (`⌘,`) and re-enter the key.
+3. Or edit `~/.hackclub-ai/config.json` directly.
+
+### Blank window or crash on launch
+
+Check the log:
+
+```bash
+tail -50 ~/Library/Logs/HackClub-AI.log
+```
+
+Then rebuild:
+
+```bash
+cd ~/Documents/hackclub-ai
+./scripts/build_macos_app.sh
+```
+
+### Rebuild from a clean state
+
+```bash
+cd ~/Documents/hackclub-ai
+rm -rf build dist ~/Applications/HackClub\ AI.app
+./scripts/build_macos_app.sh
+```
+
+---
+
+## Development
+
+### Regenerate the app icon
+
+```bash
+python scripts/make_icon.py
+```
+
+### Render the UI offscreen (visual debugging)
+
+```bash
+python scripts/render_ui.py           # conversation view
+WELCOME=1 python scripts/render_ui.py # welcome screen
+```
+
+### Build only (same as Method 2)
+
+```bash
+./scripts/build_macos_app.sh
+```
 
 ---
 
@@ -167,30 +364,12 @@ Environment variables (optional overrides):
 |---|---|
 | `hackclub_app.py` | Native macOS UI (PyObjC) — launch entry point |
 | `hackclub_ai.py` | Core chat engine, sessions, API, slash commands |
-| `scripts/build_macos_app.sh` | Build & install `HackClub AI.app` |
+| `scripts/build_macos_app.sh` | Build app, install to `~/Applications`, create DMG |
 | `scripts/make_icon.py` | Generate app icon assets |
+| `scripts/render_ui.py` | Offscreen UI rendering for debugging |
 | `assets/AppIcon-1024.png` | App icon source |
-| `~/.hackclub-ai-shell/` | Config, prefs, cache, saved sessions |
-| `~/Downloads/hackclub-chat-*.{md,json}` | Exported conversations |
-
----
-
-## Development
-
-Regenerate the app icon:
-
-```bash
-python scripts/make_icon.py
-```
-
-Render the UI offscreen for visual debugging:
-
-```bash
-python scripts/render_ui.py          # conversation view
-WELCOME=1 python scripts/render_ui.py  # welcome screen
-```
-
-App logs: `~/Library/Logs/HackClub-AI.log`
+| `requirements.txt` | Python dependencies |
+| `dist/HackClub-AI.dmg` | Distributable disk image (after build) |
 
 ---
 

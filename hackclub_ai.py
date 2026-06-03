@@ -9,7 +9,14 @@ from openrouter.types import UNSET
 API_URL = os.getenv("HACKCLUB_AI_BASE_URL", "https://ai.hackclub.com/proxy/v1")
 API_KEY = "HACKCLUB_API_KEY"
 COMPOSIO_KEY = "COMPOSIO_API_KEY"
-HOME = Path.home() / ".hackclub-ai-shell"
+HOME = Path.home() / ".hackclub-ai"
+_LEGACY_HOME = Path.home() / ".hackclub-ai-shell"
+if not HOME.exists() and _LEGACY_HOME.exists():
+    try:
+        _LEGACY_HOME.rename(HOME)
+    except OSError:
+        pass
+HOME.mkdir(parents=True, exist_ok=True)
 CACHE_DIR = HOME / "cache"
 MCP_FILE = Path(os.getenv("HC_MCP_CONFIG", str(HOME / "mcp.json")))
 MAX_FILE = int(os.getenv("HC_MAX_FILE", "5000000"))
@@ -123,7 +130,7 @@ GRILL_KICKOFF = (
     "minimum plan or design decision you would need before grilling can begin.\n"
     "Do not jump into implementation unless it helps expose a flaw in the plan."
 )
-YEET_COMMIT_FALLBACK = "chore: automated commit via HackClub CLI"
+YEET_COMMIT_FALLBACK = "chore: automated commit via HackClub AI"
 AGENTS_MD_TEMPLATE = """# AGENTS.md
 
 ## Project
@@ -182,7 +189,7 @@ CMD_DESCRIPTIONS = {
     "/sessions": "List saved chat sessions",
     "/rename": "Rename the current chat",
     "/clear": "Clear chat history",
-    "/exit": "Quit HackClub CLI",
+    "/exit": "Quit HackClub AI",
 }
 for _sk in SKILLS:
     CMD_DESCRIPTIONS.setdefault(f"/{_sk}", SKILLS[_sk].split(".")[0].strip())
@@ -245,7 +252,7 @@ INPUT_PAD_AFTER_ARROW = 1
 INPUT_PAD_RIGHT = 3
 INPUT_PAD_Y = 1
 INPUT_MAX_LINES = 8
-OUTPUT_TOP_MARGIN = 1          # margin above HackClub CLI header
+OUTPUT_TOP_MARGIN = 1          # margin above HackClub AI header
 STATUS_BOTTOM_MARGIN = 1       # margin below status bar (mirrors top)
 OUTPUT_BOTTOM_MARGIN = 2       # chat area → input
 INPUT_SLASH_GAP = 1            # one small neutral line between input and slash menu
@@ -464,7 +471,7 @@ def pick_saved_session(session_id=None):
     return None
 
 def parse_cli_args(argv):
-    parser = argparse.ArgumentParser(prog="hackclub", add_help=True)
+    parser = argparse.ArgumentParser(prog="hackclub-ai", add_help=True)
     parser.add_argument(
         "--resume",
         nargs="?",
@@ -1310,7 +1317,7 @@ class StdioMCP:
         env = os.environ.copy(); env.update(self.cfg.get("env", {}))
         self.proc = subprocess.Popen([self.cfg["command"], *self.cfg.get("args", [])], cwd=self.cfg.get("cwd"), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
         threading.Thread(target=self.reader, daemon=True).start()
-        self.rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "hackclub-shell", "version": "1.0"}}, init=True)
+        self.rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "hackclub-ai", "version": "1.0"}}, init=True)
         self.notify("notifications/initialized", {})
     def reader(self):
         for line in self.proc.stdout:
@@ -1339,7 +1346,7 @@ class HttpMCP:
         self.inited = False
     def start(self):
         if self.inited: return
-        self.rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "hackclub-shell", "version": "1.0"}}, init=True)
+        self.rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "hackclub-ai", "version": "1.0"}}, init=True)
         self.notify("notifications/initialized", {})
         self.inited = True
     def base_headers(self):

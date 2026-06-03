@@ -116,7 +116,7 @@ _load_key_from_file() {
 if [[ -z "${HACKCLUB_API_KEY:-}" && -x "$PYTHON" ]]; then
   HACKCLUB_API_KEY="$("$PYTHON" - <<'PY' 2>/dev/null || true
 import json, os
-p = os.path.expanduser("~/.hackclub-ai-shell/config.json")
+p = os.path.expanduser("~/.hackclub-ai/config.json")
 try:
     d = json.load(open(p))
     print((d.get("hackclub_api_key") or d.get("api_key") or "").strip())
@@ -151,4 +151,18 @@ echo ""
 echo "Installed: ${INSTALL_DIR}"
 echo "Launch:    open \"${INSTALL_DIR}\""
 echo ""
-echo "First launch will prompt for your Hack Club API key (saved in ~/.hackclub-ai-shell/config.json)."
+echo "First launch will prompt for your Hack Club API key (saved in ~/.hackclub-ai/config.json)."
+
+echo "==> Packaging DMG..."
+DMG_STAGING="$BUILD_DIR/dmg-staging"
+DMG_PATH="$ROOT/dist/HackClub-AI.dmg"
+rm -rf "$DMG_STAGING"
+mkdir -p "$DMG_STAGING" "$ROOT/dist"
+ditto "$APP_DIR" "$DMG_STAGING/${APP_NAME}.app"
+ln -sf /Applications "$DMG_STAGING/Applications"
+rm -f "$DMG_PATH"
+hdiutil create -volname "$APP_NAME" -srcfolder "$DMG_STAGING" -ov -format UDZO "$DMG_PATH"
+rm -rf "$DMG_STAGING"
+
+echo ""
+echo "DMG:       ${DMG_PATH}"
