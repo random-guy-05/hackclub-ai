@@ -52,13 +52,40 @@ Free access to frontier models — GPT, Claude, Gemini — with attachments, ski
 
 Pick **one** method below.
 
-### Method 1 — Install from DMG (easiest)
+### Method 1 — Install with Homebrew (recommended)
+
+Best if you want the fastest install path with the fewest manual steps.
+
+```bash
+brew tap random-guy-05/tap
+brew install --cask hackclub-ai
+```
+
+What this cask does:
+
+- downloads the release DMG from GitHub Releases
+- installs **HackClub AI.app** into your Applications folder
+- removes the quarantine attribute automatically
+- launches the app automatically after install
+
+You can also do it in one shell line:
+
+```bash
+brew tap random-guy-05/tap && brew install --cask hackclub-ai
+```
+
+> [!WARNING]
+> This is still a workaround for an unsigned, non-notarized app. It is designed to reduce friction, not to replace proper Apple code signing and notarization.
+
+---
+
+### Method 2 — Install from DMG
 
 Best if you just want the app and do not need to touch the source code.
 
 1. **Get a DMG**
    - Download a release from [GitHub Releases](https://github.com/random-guy-05/hackclub-ai/releases), **or**
-   - Build one locally (see [Method 2](#method-2--build-the-app-from-source)).
+   - Build one locally (see [Method 3](#method-3--build-the-app-from-source)).
 
 2. **Open the DMG**  
    Double-click `HackClub-AI.dmg`.
@@ -79,7 +106,7 @@ Best if you just want the app and do not need to touch the source code.
 
 ---
 
-### Method 2 — Build the app from source
+### Method 3 — Build the app from source
 
 Best if you are developing, want the latest code, or need to create a DMG to share.
 
@@ -111,7 +138,7 @@ open ~/Applications/HackClub\ AI.app
 
 ---
 
-### Method 3 — Run from source (development)
+### Method 4 — Run from source (development)
 
 Use this when you are actively editing code and want instant changes without rebuilding the `.app`.
 
@@ -299,10 +326,11 @@ These override defaults. The built `.app` reads `HACKCLUB_API_KEY` from config f
 
 ### App will not open / “damaged” or “unverified developer”
 
-This is normal for apps built locally and not notarized by Apple.
+This is most likely with locally built apps or direct DMG installs because the app is not notarized by Apple.
 
-1. Right-click **HackClub AI** in Applications → **Open** → confirm **Open**.
-2. Or use **System Settings → Privacy & Security → Open Anyway**.
+1. Try the Homebrew install path first. It removes quarantine automatically and opens the app after install.
+2. If you installed from a DMG or built locally, right-click **HackClub AI** in Applications → **Open** → confirm **Open**.
+3. Or use **System Settings → Privacy & Security → Open Anyway**.
 
 ### API key errors / “unauthorized”
 
@@ -350,11 +378,29 @@ python scripts/render_ui.py           # conversation view
 WELCOME=1 python scripts/render_ui.py # welcome screen
 ```
 
-### Build only (same as Method 2)
+### Build only (same as Method 3)
 
 ```bash
 ./scripts/build_macos_app.sh
 ```
+
+### Generate the Homebrew cask
+
+`./scripts/build_macos_app.sh` now regenerates `Casks/hackclub-ai.rb` automatically after building the DMG.
+
+You can also regenerate it directly:
+
+```bash
+python3 scripts/generate_homebrew_cask.py
+```
+
+### Release checklist
+
+1. Set the release version in `VERSION`.
+2. Run `./scripts/build_macos_app.sh`.
+3. Upload `dist/HackClub-AI.dmg` to GitHub Releases under tag `v<version>`.
+4. Commit the updated `Casks/hackclub-ai.rb`.
+5. Copy `Casks/hackclub-ai.rb` into the `homebrew-tap` repository so users can run `brew tap random-guy-05/tap && brew install --cask hackclub-ai`.
 
 ---
 
@@ -365,8 +411,11 @@ WELCOME=1 python scripts/render_ui.py # welcome screen
 | `hackclub_app.py` | Native macOS UI (PyObjC) — launch entry point |
 | `hackclub_ai.py` | Core chat engine, sessions, API, slash commands |
 | `scripts/build_macos_app.sh` | Build app, install to `~/Applications`, create DMG |
+| `scripts/generate_homebrew_cask.py` | Generate the Homebrew cask from `VERSION` and the DMG |
 | `scripts/make_icon.py` | Generate app icon assets |
 | `scripts/render_ui.py` | Offscreen UI rendering for debugging |
+| `Casks/hackclub-ai.rb` | Homebrew cask definition for release installs |
+| `VERSION` | Canonical app and release version |
 | `assets/AppIcon-1024.png` | App icon source |
 | `requirements.txt` | Python dependencies |
 | `dist/HackClub-AI.dmg` | Distributable disk image (after build) |

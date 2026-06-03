@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="HackClub AI"
 BUNDLE_ID="com.hackclub.ai"
+VERSION_FILE="$ROOT/VERSION"
 BUILD_DIR="$ROOT/build"
 APP_DIR="$BUILD_DIR/${APP_NAME}.app"
 INSTALL_DIR="${HOME}/Applications/${APP_NAME}.app"
@@ -15,6 +16,12 @@ LIB="$RESOURCES/lib"
 VENV="$RESOURCES/venv"
 ICON_SRC="$ROOT/assets/AppIcon-1024.png"
 ICON_ICNS="$ROOT/assets/AppIcon.icns"
+APP_VERSION="$(tr -d '\r\n' < "$VERSION_FILE")"
+
+if [[ -z "$APP_VERSION" ]]; then
+  echo "Missing app version in $VERSION_FILE" >&2
+  exit 1
+fi
 
 echo "==> Building ${APP_NAME}..."
 
@@ -71,9 +78,9 @@ cat > "$CONTENTS/Info.plist" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0.0</string>
+  <string>${APP_VERSION}</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>${APP_VERSION}</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
   <key>NSHighResolutionCapable</key>
@@ -166,3 +173,11 @@ rm -rf "$DMG_STAGING"
 
 echo ""
 echo "DMG:       ${DMG_PATH}"
+
+if [[ -f "$ROOT/scripts/generate_homebrew_cask.py" ]]; then
+  echo "==> Generating Homebrew cask..."
+  python3 "$ROOT/scripts/generate_homebrew_cask.py" \
+    --version "$APP_VERSION" \
+    --dmg "$DMG_PATH" \
+    --output "$ROOT/Casks/hackclub-ai.rb"
+fi
