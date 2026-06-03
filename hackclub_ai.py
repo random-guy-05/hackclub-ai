@@ -24,13 +24,19 @@ MAX_DOCX_FILE = int(os.getenv("HC_MAX_DOCX_FILE", "30000000"))
 INDEX_VERSION = "v3"
 MAX_CTX = int(os.getenv("HC_MAX_CONTEXT", "180000"))
 MAX_FILES = int(os.getenv("HC_MAX_FILES", "400"))
-MAX_TURNS = int(os.getenv("HC_MAX_TURNS", "20"))
+MAX_TURNS = int(os.getenv("HC_MAX_TURNS", "6"))
 # Long-context efficiency: cap the raw history sent per request to a char budget
-# (~chars/4 tokens), and fold older turns into a rolling summary once the live
-# context grows past a threshold so per-request input stays bounded.
-HISTORY_BUDGET = int(os.getenv("HC_HISTORY_BUDGET", str(MAX_CTX // 2)))
-AUTO_COMPACT_PCT = float(os.getenv("HC_AUTO_COMPACT_PCT", "75"))
-AUTO_COMPACT_KEEP = int(os.getenv("HC_AUTO_COMPACT_KEEP", "6"))
+# (~chars/4 tokens), and fold older turns into a rolling summary once cumulative
+# input tokens cross a threshold so per-request input stays bounded.
+HISTORY_BUDGET = int(os.getenv("HC_HISTORY_BUDGET", "6000"))
+AUTO_COMPACT_INPUT_TOKENS = int(os.getenv("HC_AUTO_COMPACT_INPUT_TOKENS", "5000"))
+AUTO_COMPACT_PCT = float(os.getenv("HC_AUTO_COMPACT_PCT", "0"))  # legacy; 0 disables
+AUTO_COMPACT_KEEP = int(os.getenv("HC_AUTO_COMPACT_KEEP", "2"))
+SUMMARY_MAX_CHARS = int(os.getenv("HC_SUMMARY_MAX_CHARS", "3500"))
+ATTACH_CTX_BUDGET = int(os.getenv("HC_ATTACH_CTX_BUDGET", "10000"))
+AUTO_COMPACT_MAX_WORDS = int(os.getenv("HC_AUTO_COMPACT_MAX_WORDS", "400"))
+HISTORY_MSG_CHARS = int(os.getenv("HC_HISTORY_MSG_CHARS", "2400"))
+COMPACT_MODEL = os.getenv("HC_COMPACT_MODEL", "~openai/gpt-mini-latest")
 CACHE_TTL = int(os.getenv("HC_CACHE_TTL", "86400"))
 MCP_TTL = int(os.getenv("HC_MCP_CACHE_TTL", "300"))
 CTX_WINDOW = int(os.getenv("HC_CONTEXT_WINDOW", "200000"))
@@ -270,7 +276,7 @@ DEFAULT_MODEL = os.getenv("HC_DEFAULT_MODEL", "~openai/gpt-mini-latest")
 FALLBACK_MODEL = os.getenv("HC_FALLBACK_MODEL", "deepseek/deepseek-v4-flash")
 THINK_INDENT = 4
 FOLLOW_MIN_S = 0.15
-STREAM_REDRAW_S = 0.22
+STREAM_REDRAW_S = 0.04
 
 def load_prefs():
     try:
@@ -776,6 +782,22 @@ def md_to_fragments(text, width=100, indent=0, tone="normal"):
                 out.append((blank, "\n"))
     return out or [("class:text", "")]
 
+def stream_md_fragments(text, width=100, indent=0, tone="normal"):
+    """Format completed lines as markdown; render the in-progress line as plain text."""
+    if not text:
+        return [("class:text", "")]
+    pad = " " * indent
+    blank = "class:think" if tone == "think" else "class:text"
+    last_nl = text.rfind("\n")
+    if last_nl == -1:
+        return [(blank, pad + text)]
+    stable = text[: last_nl + 1]
+    tail = text[last_nl + 1 :]
+    out = md_to_fragments(stable, width, indent=indent, tone=tone) if stable.strip() else []
+    if tail:
+        out.append((blank, pad + tail))
+    return out or [(blank, pad + text)]
+
 def normalize_input(raw):
     raw = raw.strip()
     if not raw:
@@ -899,7 +921,7 @@ class Indexer:
             return Attachment(aid, f"Image: {path.name}", "image", path, {"mime": mime, "data": data}, len(data))
         text = self.text(path)
         if not text: return None
-        body = f"### Attachment: {path.name}\n```text\n{text[:MAX_CTX]}\n```"
+        body = f"### Attachment: {path.name}\n```text\n{text[:min(MAX_CTX, ATTACH_CTX_BUDGET)]}\n```"
         return Attachment(aid, f"File: {path.name}", "text", path, body, len(body))
     def dir(self, root, aid):
         all_files = []
@@ -938,7 +960,7 @@ class Indexer:
             if count >= MAX_FILES:
                 not_loaded[rel_path] = "per-folder file limit reached"
                 continue
-            if total >= MAX_CTX:
+            if total >= min(MAX_CTX, ATTACH_CTX_BUDGET):
                 not_loaded[rel_path] = "context budget filled"
                 continue
             text = self.text(path)
@@ -946,8 +968,8 @@ class Indexer:
                 not_loaded[rel_path] = "empty / parse failed"
                 continue
             chunk_body = f"--- START FILE: {rel_path} ---\n{text}\n--- END FILE: {rel_path} ---"
-            if total + len(chunk_body) > MAX_CTX:
-                chunk_body = chunk_body[:MAX_CTX - total]
+            if total + len(chunk_body) > min(MAX_CTX, ATTACH_CTX_BUDGET):
+                chunk_body = chunk_body[:min(MAX_CTX, ATTACH_CTX_BUDGET) - total]
             loaded[rel_path] = chunk_body
             total += len(chunk_body)
             count += 1
@@ -1625,7 +1647,7 @@ class Shell:
         self._last_activity = data.get("updated_at") or time.strftime("%Y-%m-%dT%H:%M:%S")
         self.history = list(data.get("history") or [])
         self.custom_title = (data.get("custom_title") or "").strip() or None
-        self.transcript_summary = data.get("transcript_summary")
+        self.transcript_summary = self._trim_summary(data.get("transcript_summary")) if data.get("transcript_summary") else None
         if data.get("model"):
             self.model = data["model"]
         if data.get("reasoning_level"):
@@ -1734,6 +1756,12 @@ class Shell:
 
     def touch_body(self, scroll_bottom=False):
         now = time.time()
+        if scroll_bottom:
+            self.follow_output = True
+            self._keep_at_top = False
+        if self.ui_delegate and getattr(self.ui_delegate, "_stream_animating", False):
+            self._last_touch = now
+            return
         if now - self._last_touch < STREAM_REDRAW_S:
             return
         self._last_touch = now
@@ -1791,7 +1819,7 @@ class Shell:
             except Exception:
                 pass
         return 80
-    def render_body(self):
+    def render_body(self, stream_reveal=None, think_reveal=None, activity_frame=None, activity_busy=False):
         self._ensure_ui()
         _ = self._body_ver
         with self._frag_lock:
@@ -1808,6 +1836,36 @@ class Shell:
         out = []
         if OUTPUT_TOP_MARGIN:
             out.append(("class:text", LINE * OUTPUT_TOP_MARGIN))
+        reveal_idx = None
+        if stream_reveal is not None:
+            for j, blk in enumerate(blocks):
+                if blk.kind == "stream":
+                    reveal_idx = j
+                    break
+            if reveal_idx is None and stream_reveal.get("finalize"):
+                last_asst = None
+                for j, blk in enumerate(blocks):
+                    if blk.kind == "asst":
+                        last_asst = j
+                if last_asst is not None:
+                    for j in range(len(blocks) - 1, last_asst, -1):
+                        if blocks[j].kind == "md":
+                            reveal_idx = j
+                            break
+        think_reveal_idx = None
+        if think_reveal is not None:
+            for j, blk in enumerate(blocks):
+                if blk.kind == "think_live":
+                    think_reveal_idx = j
+                    break
+            if think_reveal_idx is None and think_reveal.get("finalize"):
+                for j in range(len(blocks) - 1, -1, -1):
+                    if blocks[j].kind == "think":
+                        think_reveal_idx = j
+                        break
+        writing = any(b.kind == "stream" for b in blocks)
+        rendered_spin = False
+        rendered_think = False
         last = len(blocks) - 1
         for i, b in enumerate(blocks):
             nxt = blocks[i + 1].kind if i < last else None
@@ -1835,28 +1893,63 @@ class Shell:
             elif b.kind == "asst":
                 out.append(("class:asst_label", f"Assistant{HEADER_GAP}"))
             elif b.kind in ("md", "stream"):
-                if b.kind == "stream":
-                    pad = " " * CONTENT_INDENT
-                    for line in b.text.splitlines() or [""]:
-                        out.append(("class:text", pad + line + LINE))
-                elif self.compact:
-                    text = re.sub(r"\s+", " ", b.text.strip())
+                text = b.text
+                show_cursor = False
+                if stream_reveal is not None and i == reveal_idx:
+                    visible = max(0, min(stream_reveal.get("visible", len(text)), len(text)))
+                    text = text[:visible]
+                    show_cursor = bool(stream_reveal.get("cursor")) and visible < len(b.text)
+                if self.compact:
+                    text = re.sub(r"\s+", " ", text.strip())
                     if len(text) > 240:
                         text = text[:240] + "..."
                     out.append(("class:user_msg", f"  {text}{LINE}"))
                 else:
-                    out.extend(md_to_fragments(b.text, width, indent=CONTENT_INDENT))
-                    if not b.text.endswith("\n"):
+                    live_stream = stream_reveal is not None and i == reveal_idx
+                    if live_stream:
+                        out.extend(stream_md_fragments(text, width, indent=CONTENT_INDENT))
+                    else:
+                        out.extend(md_to_fragments(text, width, indent=CONTENT_INDENT))
+                    if show_cursor:
+                        out.append(("class:cursor", "▍"))
+                    if text and not text.endswith("\n") and not show_cursor:
+                        out.append(("class:text", LINE))
+                    elif not text and show_cursor:
                         out.append(("class:text", LINE))
             elif b.kind in ("think", "think_live"):
                 if self.compact:
                     continue
-                if b.text.strip():
+                text = b.text
+                show_cursor = False
+                is_live = b.kind == "think_live"
+                if think_reveal is not None and i == think_reveal_idx:
+                    visible = max(0, min(think_reveal.get("visible", len(text)), len(text)))
+                    text = text[:visible]
+                    show_cursor = bool(think_reveal.get("cursor")) and visible < len(b.text)
+                    is_live = bool(think_reveal.get("live")) or is_live
+                show_block = bool(text.strip()) or show_cursor or (is_live and think_reveal is not None)
+                if show_block:
+                    rendered_think = True
                     pad = " " * THINK_INDENT
-                    header = "Reasoning" if b.kind == "think_live" else "Reasoned"
+                    if is_live and activity_frame is not None:
+                        dots = "." * (1 + (activity_frame // 8) % 3)
+                        header = f"Thinking{dots}"
+                    else:
+                        header = "Reasoned"
                     out.append(("class:think_label", pad + f"{header}{HEADER_GAP}"))
-                    out.extend(md_to_fragments(b.text, width, indent=THINK_INDENT, tone="think"))
-                    if not b.text.endswith("\n"):
+                    if text.strip():
+                        if think_reveal is not None and i == think_reveal_idx:
+                            out.extend(stream_md_fragments(text, width, indent=THINK_INDENT, tone="think"))
+                        else:
+                            out.extend(md_to_fragments(text, width, indent=THINK_INDENT, tone="think"))
+                    elif is_live and think_reveal is not None and activity_frame is not None:
+                        pulse = " " * max(0, THINK_INDENT - 2) + SPINNER[activity_frame % len(SPINNER)]
+                        out.append(("class:think_pulse", pulse + LINE))
+                    if show_cursor:
+                        out.append(("class:cursor", "▍"))
+                    if text and not text.endswith("\n") and not show_cursor:
+                        out.append(("class:text", LINE))
+                    elif show_cursor and not text.strip():
                         out.append(("class:text", LINE))
                     if nxt == "md":
                         nxt_text = blocks[i + 1].text.strip() if i + 1 < len(blocks) else "x"
@@ -1864,7 +1957,15 @@ class Shell:
                         if not (not nxt_text and nxt2 == "notify"):
                             out.append(("class:text", THINK_REPLY_GAP))
             elif b.kind == "spin":
-                out.append((b.style or "class:spin", "  " + b.text + LINE))
+                rendered_spin = True
+                if activity_frame is not None:
+                    verb = "Writing" if writing else "Thinking"
+                    glyph = SPINNER[activity_frame % len(SPINNER)]
+                    dots = SPINNER_DOTS[(activity_frame // 3) % len(SPINNER_DOTS)]
+                    status = f"{glyph}  {verb}{dots}"
+                    out.append((b.style or "class:spin", "  " + status + LINE))
+                else:
+                    out.append((b.style or "class:spin", "  " + b.text + LINE))
             elif b.kind == "attach":
                 out.append(("class:attach", f"{BLANK}{b.text}{LINE}"))
             elif b.kind == "notify":
@@ -1882,6 +1983,18 @@ class Shell:
                 out.append((b.style, b.text))
                 if nxt is not None and b.kind in WELCOME_KINDS and nxt in WELCOME_KINDS:
                     continue
+        if activity_frame is not None and activity_busy and not rendered_spin:
+            verb = "Writing" if writing else "Thinking"
+            glyph = SPINNER[activity_frame % len(SPINNER)]
+            dots = SPINNER_DOTS[(activity_frame // 3) % len(SPINNER_DOTS)]
+            out.append(("class:spin", f"  {glyph}  {verb}{dots}{LINE}"))
+            rendered_spin = True
+        if activity_frame is not None and activity_busy and not rendered_think and not writing:
+            pad = " " * THINK_INDENT
+            dots = "." * (1 + (activity_frame // 8) % 3)
+            out.append(("class:think_label", pad + f"Thinking{dots}{HEADER_GAP}"))
+            pulse = " " * max(0, THINK_INDENT - 2) + SPINNER[activity_frame % len(SPINNER)]
+            out.append(("class:think_pulse", pulse + LINE))
         return out
     def write_root(self):
         for a in self.attachments:
@@ -1943,6 +2056,8 @@ class Shell:
                 bits.insert(1, self.session_mode)
             if self.transcript_summary:
                 bits.insert(1, "compact")
+            if self.session_input_tokens() >= max(1, AUTO_COMPACT_INPUT_TOKENS - 500):
+                bits.insert(1, f"tok≥{AUTO_COMPACT_INPUT_TOKENS // 1000}k")
             left = "  ".join(bits)
             if self.goal:
                 timer = self.format_goal_timer()
@@ -1983,11 +2098,45 @@ class Shell:
         self.ui_invalidate()
         self.ok(f"theme: {name}")
     def max_history_msgs(self):
-        return 6 if self.compact else MAX_TURNS * 2
+        return 4 if self.compact else MAX_TURNS * 2
     def max_ctx_limit(self):
-        return MAX_CTX // 4 if self.compact else MAX_CTX
+        return min(MAX_CTX, ATTACH_CTX_BUDGET * 3) if self.compact else min(MAX_CTX, ATTACH_CTX_BUDGET * 4)
     def history_budget(self):
-        return HISTORY_BUDGET // 4 if self.compact else HISTORY_BUDGET
+        return max(1200, HISTORY_BUDGET // 4) if self.compact else HISTORY_BUDGET
+    def session_input_tokens(self):
+        return int(self.session_usage.input + self.usage.input)
+    def estimated_live_input_tokens(self):
+        sys_chars = len(self.system + self.mode_prompt())
+        return self.live_input_chars() // 4 + sys_chars // 4
+    def should_auto_compact(self):
+        if self.session_input_tokens() >= AUTO_COMPACT_INPUT_TOKENS:
+            return True
+        if self.estimated_live_input_tokens() >= AUTO_COMPACT_INPUT_TOKENS:
+            return True
+        if AUTO_COMPACT_PCT > 0 and self.live_ctx_pct() >= AUTO_COMPACT_PCT:
+            return True
+        return False
+    def _trim_summary(self, text):
+        text = (text or "").strip()
+        if len(text) <= SUMMARY_MAX_CHARS:
+            return text
+        return text[:SUMMARY_MAX_CHARS].rstrip() + "\n[summary truncated for token budget]"
+    def _trim_history_for_send(self, hist):
+        cap = max(400, HISTORY_MSG_CHARS // 2) if self.compact else HISTORY_MSG_CHARS
+        out = []
+        for m in hist:
+            mc = dict(m)
+            text = message_text(mc.get("content", ""))
+            if len(text) > cap:
+                mc["content"] = text[:cap] + "…"
+            out.append(mc)
+        return out
+    def ensure_context_lean(self):
+        if self.session_mode == "side" or self._stopped():
+            return
+        for _ in range(4):
+            if not self.auto_compact_if_needed():
+                break
     def history_window(self):
         # Most-recent-first selection bounded by both a message cap and a char budget,
         # so a few huge turns can't blow up per-request input on long-context chats.
@@ -2075,6 +2224,21 @@ class Shell:
                 if kind != "reasoning":
                     out += piece
         return out.strip()
+    def call_compact_model(self, msgs):
+        active = COMPACT_MODEL or FALLBACK_MODEL or self.model
+        out = ""
+        for chunk in self.client.chat.send(
+            model=active,
+            messages=msgs,
+            stream=True,
+        ):
+            if self._stopped():
+                break
+            self.read_usage(chunk, invalidate=False)
+            for kind, piece in self.delta_parts(chunk):
+                if kind != "reasoning":
+                    out += piece
+        return out.strip()
     def _clear_chat_ui(self):
         with self._frag_lock:
             keep = []
@@ -2102,11 +2266,11 @@ class Shell:
         prompt = (
             "Compress this conversation into a dense structured brief for future model context. "
             "Preserve decisions, constraints, open questions, current task state, file paths, and technical details. "
-            "Use sections and bullets. Stay under 2000 words.\n\n" + transcript
+            f"Use sections and bullets. Stay under {AUTO_COMPACT_MAX_WORDS} words — omit fluff.\n\n" + transcript
         )
         try:
-            summary = self.call_model([
-                {"role": "system", "content": "You summarize chat transcripts without losing actionable detail."},
+            summary = self.call_compact_model([
+                {"role": "system", "content": "You summarize chat transcripts without losing actionable detail. Minimize tokens."},
                 {"role": "user", "content": prompt},
             ])
         except Exception as e:
@@ -2115,22 +2279,19 @@ class Shell:
             return self.warn("generation stopped")
         if not summary:
             return self.err("compact failed: empty summary")
-        self.transcript_summary = summary
+        self.transcript_summary = self._trim_summary(summary)
         self.history.clear()
         self._clear_chat_ui()
         self.persist_session()
-        self.info(f"transcript compacted ({len(summary):,} chars) — previous turns replaced by summary")
+        self.info(f"transcript compacted ({len(self.transcript_summary):,} chars) — previous turns replaced by summary")
         self.refresh_status()
     def auto_compact_if_needed(self):
-        # Fold the oldest turns into a rolling summary once live context crosses the
-        # threshold. Unlike /compact this keeps the visible transcript intact and only
-        # shrinks what is sent to the model, preserving detail in the summary.
-        if self.session_mode == "side" or self.compact or self._stopped():
+        # Fold the oldest turns into a rolling summary once cumulative input tokens
+        # cross the threshold. Unlike /compact this keeps the visible transcript intact
+        # and only shrinks what is sent to the model.
+        if self.session_mode == "side" or self._stopped():
             return False
-        try:
-            if self.live_ctx_pct() < AUTO_COMPACT_PCT:
-                return False
-        except Exception:
+        if not self.should_auto_compact():
             return False
         keep = max(2, AUTO_COMPACT_KEEP)
         if len(self.history) <= keep + 2:
@@ -2141,26 +2302,38 @@ class Shell:
         if self.transcript_summary:
             lines.append(f"PRIOR SUMMARY:\n{self.transcript_summary}")
         for m in old:
-            lines.append(f"{m.get('role', '?').upper()}: {message_text(m.get('content', ''))}")
+            role = m.get("role", "?").upper()
+            text = message_text(m.get("content", ""))
+            if len(text) > 1400:
+                text = text[:1400] + "…"
+            lines.append(f"{role}: {text}")
         prompt = (
             "Update the running brief for this conversation so future turns stay grounded. "
             "Merge any prior summary with the new turns into one dense brief. "
             "Preserve decisions, constraints, open questions, task state, file paths, and key facts. "
-            "Use sections and bullets. Stay under 1500 words.\n\n" + "\n\n".join(lines)
+            f"Use sections and bullets. Stay under {AUTO_COMPACT_MAX_WORDS} words — omit fluff.\n\n"
+            + "\n\n".join(lines)
         )
         try:
-            summary = self.call_model([
-                {"role": "system", "content": "You maintain a compact running brief of a chat without losing actionable detail."},
+            summary = self.call_compact_model([
+                {"role": "system", "content": "You maintain an extremely compact running brief. Minimize tokens; keep only actionable facts."},
                 {"role": "user", "content": prompt},
             ])
         except Exception:
             return False
         if self._stopped() or not summary or not summary.strip():
             return False
-        self.transcript_summary = summary.strip()
+        self.transcript_summary = self._trim_summary(summary)
         self.history = recent
+        self.session_usage.input += self.usage.input
+        self.session_usage.output += self.usage.output
+        self.session_usage.cached += self.usage.cached
+        self.usage = Usage()
         self.persist_session()
-        self.info(f"auto-compacted older turns to keep context lean (summary {len(summary):,} chars)")
+        self.info(
+            f"auto-compacted at {self.session_input_tokens():,} input tokens "
+            f"(summary {len(self.transcript_summary):,} chars, kept {len(recent)} msgs)"
+        )
         self.refresh_status()
         return True
     def side_cmd(self, rest):
@@ -2319,6 +2492,27 @@ class Shell:
         with self._frag_lock:
             self.blocks.append(UiBlock("asst", ""))
         self.follow_latest(force=True)
+    def show_thinking_indicator(self):
+        """Show assistant header + spinner immediately, before any slow preflight work."""
+        self._ensure_ui()
+        with self._frag_lock:
+            needs_asst = True
+            for b in reversed(self.blocks):
+                if b.kind == "user":
+                    break
+                if b.kind == "asst":
+                    needs_asst = False
+                    break
+            if needs_asst:
+                self.blocks.append(UiBlock("asst", ""))
+            if not any(b.kind == "spin" for b in self.blocks):
+                self.blocks.append(UiBlock("spin", "", "class:spin"))
+        self.follow_latest(force=True)
+        if self.ui_delegate and hasattr(self.ui_delegate, "ensure_live_animation"):
+            try:
+                self.ui_delegate.ensure_live_animation()
+            except Exception:
+                pass
     def model_label(self):
         for name, mid in MODELS:
             if mid == self.model: return name
@@ -2749,29 +2943,29 @@ class Shell:
         msgs = [{"role": "system", "content": system}]
 
         ctx_limit = self.max_ctx_limit()
+        attach_budget = min(ctx_limit, ATTACH_CTX_BUDGET)
         texts = [str(a.content) for a in self.attachments if a.kind == "text"]
         images = [{"type": "image_url", "image_url": {"url": f"data:{a.content['mime']};base64,{a.content['data']}"}} for a in self.attachments if a.kind == "image"]
         if texts:
-            context_text = "\n\n".join(texts)[:ctx_limit]
-            intro = ("The following attached context is stable across turns — it is the same on every turn until "
-                     "files change. Refer back to it as needed; do not ask the user to re-paste it.\n\n")
+            context_text = "\n\n".join(texts)[:attach_budget]
+            intro = "Attached context (stable until files change):\n\n"
             ctx_payload = intro + context_text
             if anthropic:
                 ws_content = [{"type": "text", "text": ctx_payload, "cache_control": {"type": "ephemeral"}}]
                 msgs.append({"role": "user", "content": ws_content})
             else:
                 msgs.append({"role": "user", "content": ctx_payload})
-            msgs.append({"role": "assistant", "content": "Acknowledged. I'll use the attached files as context for this conversation."})
+            msgs.append({"role": "assistant", "content": "OK."})
         if self.transcript_summary:
-            summary_text = "Compacted conversation summary from earlier in this session:\n\n" + self.transcript_summary
+            summary_text = "Prior session summary:\n\n" + self._trim_summary(self.transcript_summary)
             if anthropic:
                 msgs.append({"role": "user", "content": [
                     {"type": "text", "text": summary_text, "cache_control": {"type": "ephemeral"}}]})
             else:
                 msgs.append({"role": "user", "content": summary_text})
-            msgs.append({"role": "assistant", "content": "Acknowledged. I'll treat that summary as prior session context."})
+            msgs.append({"role": "assistant", "content": "OK."})
 
-        hist = self.history_window()
+        hist = self._trim_history_for_send(self.history_window())
         if anthropic and hist:
             # Cache everything up to and including the previous turn; only the new prompt is uncached.
             cached_last = dict(hist[-1])
@@ -2790,7 +2984,7 @@ class Shell:
         name = (rest or "").strip().lower()
         if not name:
             return self.ok(f"theme: {self.theme_name} (dark, light)")
-        return self.ui_delegately_theme(name)
+        return self.apply_theme(name)
     def send(self, prompt):
         try:
             self._clear_stop()
@@ -2799,12 +2993,13 @@ class Shell:
             self.usage = Usage()
             self.refresh_status()
             self.show_user(prompt)
+            self.show_thinking_indicator()
+            self.ensure_context_lean()
             msgs = self.messages(prompt, model=self.model)
             final = ""
             mcp_task = self.mcp.enabled and bool(self.mcp.servers) and user_wants_mcp(prompt)
             mcp_calls = 0
             nudges = 0
-            self.show_assistant_start()
             fs_calls = 0
             fs_nudges = 0
             fs_task = user_wants_fs(prompt, self)
@@ -2894,7 +3089,7 @@ class Shell:
                 self.persist_session()
                 self.refresh_status(invalidate=True)
                 if not self._stopped():
-                    self.auto_compact_if_needed()
+                    self.ensure_context_lean()
         except Exception as e:
             self.err(str(e))
     def stream_text(self, msgs, model=None, _is_fallback=False):
@@ -2905,29 +3100,22 @@ class Shell:
         think_i = None
         out_i = None
         with self._frag_lock:
-            spin_i = len(self.blocks)
-            base = "Thinking" if not _is_fallback else f"Thinking · fallback {active_model}"
-            self.blocks.append(UiBlock("spin", SPINNER_BAR[0] + "  " + base, "class:spin"))
+            spin_i = None
+            for i, b in enumerate(self.blocks):
+                if b.kind == "spin":
+                    spin_i = i
+                    break
+            if spin_i is None:
+                spin_i = len(self.blocks)
+                self.blocks.append(UiBlock("spin", "", "class:spin"))
         self.follow_latest(force=True)
-        stop = threading.Event()
-        def spin():
-            i = 0
-            # Switch label to "Writing" once response text has started streaming.
-            while not stop.wait(0.07):
-                with self._frag_lock:
-                    if spin_i is None or spin_i >= len(self.blocks) or self.blocks[spin_i].kind != "spin":
-                        break
-                    verb = "Writing" if out_i is not None else base
-                    dots = SPINNER_DOTS[(i // 4) % len(SPINNER_DOTS)]
-                    glyph = SPINNER_BAR[i % len(SPINNER_BAR)]
-                    self.blocks[spin_i] = UiBlock("spin", f"{glyph}  {verb}{dots}", "class:spin")
-                i += 1
-        worker = threading.Thread(target=spin, daemon=True)
-        worker.start()
+        if self.ui_delegate and hasattr(self.ui_delegate, "ensure_live_animation"):
+            try:
+                self.ui_delegate.ensure_live_animation()
+            except Exception:
+                pass
         def end_spin():
             nonlocal spin_i
-            stop.set()
-            worker.join(timeout=0.3)
             with self._frag_lock:
                 if spin_i is not None and spin_i < len(self.blocks) and self.blocks[spin_i].kind == "spin":
                     self.blocks.pop(spin_i)
@@ -2957,6 +3145,11 @@ class Shell:
                                 elif think_i < len(self.blocks):
                                     self.blocks[think_i].text = think
                             self.touch_body(scroll_bottom=True)
+                            if self.ui_delegate and hasattr(self.ui_delegate, "ensure_live_animation"):
+                                try:
+                                    self.ui_delegate.ensure_live_animation()
+                                except Exception:
+                                    pass
                         continue
                     if out_i is None:
                         end_spin()
@@ -2966,7 +3159,11 @@ class Shell:
                     out += piece
                     with self._frag_lock:
                         self.blocks[out_i].text = out
-                    self.touch_body(scroll_bottom=True)
+                    if self.ui_delegate and hasattr(self.ui_delegate, "sync_stream_target"):
+                        try:
+                            self.ui_delegate.sync_stream_target(out)
+                        except Exception:
+                            pass
             self.refresh_status(invalidate=True)
             self._finalize_stream_blocks(out, think, out_i, think_i, spin_i, end_spin)
             if self._stopped():

@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import threading
+import time
 import warnings
 
 import AppKit
@@ -60,7 +61,7 @@ from AppKit import (
     NSWindowStyleMaskResizable,
     NSWindowStyleMaskTitled,
 )
-from Foundation import NSMakeRange, NSObject
+from Foundation import NSMakeRange, NSObject, NSTimer
 from PyObjCTools import AppHelper
 
 from hackclub_ai import (
@@ -86,6 +87,9 @@ from hackclub_ai import (
     rename_saved_session,
     save_api_key,
     save_composio_key,
+    save_prefs,
+    SPINNER,
+    SPINNER_DOTS,
     session_display_title,
     session_title_from_history,
 )
@@ -96,6 +100,12 @@ TOPBAR_H = 60
 COMPOSER_H = 132
 CHAT_PAD = 32
 BUBBLE_MAX = 620
+
+STREAM_ANIM_INTERVAL = 0.008
+STREAM_ANIM_BASE_CPS = 150
+STREAM_ANIM_MAX_CPS = 650
+THINK_ANIM_BASE_CPS = 110
+THINK_ANIM_MAX_CPS = 480
 
 SUGGESTIONS = [
     ("Explain a codebase", "/explain How does this project work?"),
@@ -188,7 +198,13 @@ STYLE_MAP = {
     "class:error": "error",
     "class:think": "text_muted",
     "class:think_label": "accent",
+    "class:think_pulse": "text_muted",
+    "class:think_strong": "text_secondary",
+    "class:think_em": "text_muted",
+    "class:think_h": "accent",
+    "class:think_code": "code_text",
     "class:spin": "accent",
+    "class:cursor": "accent",
     "class:md_strong": "text",
     "class:md_em": "text_secondary",
     "class:code": "code_text",
@@ -362,6 +378,35 @@ def make_popup(width=180):
     if cell is not None:
         cell.setArrowPosition_(AppKit.NSPopUpArrowAtBottom)
     return popup
+
+
+def style_popup(popup, theme, light=False):
+    popup.setContentTintColor_(rgb_color(theme["accent"]))
+    title = popup.titleOfSelectedItem() or ""
+    popup.setAttributedTitle_(
+        NSAttributedString.alloc().initWithString_attributes_(
+            title,
+            {
+                NSForegroundColorAttributeName: rgb_color(theme["text"]),
+                NSFontAttributeName: popup.font(),
+            },
+        )
+    )
+    appearance_name = "NSAppearanceNameAqua" if light else "NSAppearanceNameDarkAqua"
+    appearance = AppKit.NSAppearance.appearanceNamed_(appearance_name)
+    popup.setAppearance_(appearance)
+    menu = popup.menu()
+    if menu is not None:
+        menu.setAppearance_(appearance)
+
+
+def style_picker_chip(chip, popup, theme, light=False):
+    chip.layer().setBackgroundColor_(rgb_color(theme["surface"]).CGColor())
+    chip.layer().setBorderColor_(rgb_color(theme["border"]).CGColor())
+    for sub in chip.subviews():
+        if isinstance(sub, NSTextField):
+            sub.setTextColor_(rgb_color(theme["text_muted"]))
+    style_popup(popup, theme, light=light)
 
 
 def make_picker_chip(label_text, popup, theme, popup_w):
@@ -668,6 +713,14 @@ class MacChatUI(NSObject):
     _last_render_ver = objc.ivar("_last_render_ver")
     _slash_timer = objc.ivar("_slash_timer")
     _slash_height = objc.ivar("_slash_height")
+    _stream_anim_timer = objc.ivar("_stream_anim_timer")
+    _ns_anim_timer = objc.ivar("_ns_anim_timer")
+    _stream_visible = objc.ivar("_stream_visible")
+    _stream_target = objc.ivar("_stream_target")
+    _think_visible = objc.ivar("_think_visible")
+    _think_target = objc.ivar("_think_target")
+    _activity_frame = objc.ivar("_activity_frame")
+    _stream_animating = objc.ivar("_stream_animating")
 
     def initWithShell_(self, shell):
         self = objc.super(MacChatUI, self).init()
@@ -680,6 +733,15 @@ class MacChatUI(NSObject):
         self._last_render_ver = -1
         self._slash_timer = None
         self._attach_height = None
+        self._stream_anim_timer = None
+        self._ns_anim_timer = None
+        self._stream_visible = None
+        self._stream_target = ""
+        self._think_visible = None
+        self._think_target = ""
+        self._activity_frame = 0
+        self._anim_last_ts = 0.0
+        self._stream_animating = False
         self.buildMainWindow()
         return self
 
@@ -687,7 +749,223 @@ class MacChatUI(NSObject):
 
     @objc.python_method
     def requestRefresh(self):
+        if self._stream_animating:
+            self.run_on_main(self._renderChatOnly)
+        else:
+            self.run_on_main(self.refreshAll)
+
+    @objc.python_method
+    def sync_stream_target(self, text):
+        self._stream_target = text or ""
+        if self._stream_visible is None:
+            self._stream_visible = 0
+
+    @objc.python_method
+    def ensure_live_animation(self):
+        if not self._stream_animating:
+            self._stream_visible = 0
+            self._stream_target = ""
+            self._think_visible = 0
+            self._think_target = ""
+            self._activity_frame = 0
+            self._stream_animating = True
+            self.run_on_main(self._armAnimationTimer)
+        else:
+            self.run_on_main(self._renderChatOnly)
+
+    @objc.python_method
+    def set_busy(self, busy):
+        self.setBusyState(busy)
+        if not busy and not self._streamStillAnimating() and not self._thinkStillAnimating():
+            self._stopStreamAnimation()
+
+    @objc.python_method
+    def _armAnimationTimer(self):
+        self._anim_last_ts = time.time()
+        self._scheduleStreamAnimationTick()
+        self._renderChatOnly()
+
+    @objc.python_method
+    def _liveStreamText(self):
+        with self.shell._frag_lock:
+            for block in reversed(self.shell.blocks):
+                if block.kind == "stream":
+                    return block.text, True
+        return None, False
+
+    @objc.python_method
+    def _streamStillAnimating(self):
+        if self._stream_visible is None:
+            return False
+        target = self._stream_target or ""
+        live, _ = self._liveStreamText()
+        if live:
+            target = live
+        return bool(target) and self._stream_visible < len(target)
+
+    @objc.python_method
+    def _streamReveal(self):
+        live, is_live = self._liveStreamText()
+        if self._stream_visible is None:
+            return None
+        target = live if live is not None else (self._stream_target or "")
+        if not target and self._stream_target:
+            target = self._stream_target
+        if not target and not is_live and not self.shell.busy:
+            return None
+        visible = max(0, min(self._stream_visible, len(target)))
+        return {
+            "visible": visible,
+            "cursor": is_live or (bool(target) and visible < len(target)),
+            "finalize": not is_live and bool(target),
+        }
+
+    @objc.python_method
+    def _startStreamAnimation(self):
+        self.ensure_live_animation()
+
+    @objc.python_method
+    def _cancel_ns_anim_timer(self):
+        timer = getattr(self, "_ns_anim_timer", None)
+        if timer is not None:
+            timer.invalidate()
+            self._ns_anim_timer = None
+
+    @objc.python_method
+    def _stopStreamAnimation(self):
+        self._stream_animating = False
+        if self._stream_anim_timer:
+            self._stream_anim_timer.cancel()
+            self._stream_anim_timer = None
+
+        def _stop_on_main():
+            self._cancel_ns_anim_timer()
+            self._stream_visible = None
+            self._stream_target = ""
+            self._think_visible = None
+            self._think_target = ""
+            self._activity_frame = 0
+
+        self.run_on_main(_stop_on_main)
+
+    @objc.python_method
+    def _liveThinkText(self):
+        with self.shell._frag_lock:
+            for block in reversed(self.shell.blocks):
+                if block.kind == "think_live":
+                    return block.text, True
+        return None, False
+
+    @objc.python_method
+    def _thinkStillAnimating(self):
+        if self._think_visible is None:
+            return False
+        target = self._think_target or ""
+        live, _ = self._liveThinkText()
+        if live:
+            target = live
+        return bool(target) and self._think_visible < len(target)
+
+    @objc.python_method
+    def _thinkReveal(self):
+        live, is_live = self._liveThinkText()
+        target = live if live is not None else self._think_target
+        if self._think_visible is None:
+            return None
+        if not target and not is_live and not self.shell.busy:
+            return None
+        visible = max(0, min(self._think_visible, len(target))) if target else 0
+        return {
+            "visible": visible,
+            "cursor": is_live or (target and visible < len(target)),
+            "finalize": not is_live and bool(target),
+            "live": is_live or self.shell.busy,
+        }
+
+    @objc.python_method
+    def _advanceTypewriter(self, visible, target, base_cps, max_cps, dt):
+        if visible is None:
+            visible = 0
+        if not target:
+            return visible
+        lag = len(target) - visible
+        if lag <= 0:
+            return visible
+        rate = base_cps + min(lag * 5, max_cps - base_cps)
+        step = max(1, int(rate * max(dt, STREAM_ANIM_INTERVAL * 0.5)))
+        return min(len(target), visible + step)
+
+    @objc.python_method
+    def _scheduleStreamAnimationTick(self):
+        self._cancel_ns_anim_timer()
+        if self._stream_anim_timer:
+            self._stream_anim_timer.cancel()
+            self._stream_anim_timer = None
+        self._ns_anim_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            STREAM_ANIM_INTERVAL,
+            self,
+            "streamAnimationTick:",
+            None,
+            True,
+        )
+
+    def streamAnimationTick_(self, timer):
+        self._tickStreamAnimation()
+
+    @objc.python_method
+    def _tickStreamAnimation(self):
+        now = time.time()
+        last = getattr(self, "_anim_last_ts", now) or now
+        dt = min(0.05, max(0.001, now - last))
+        self._anim_last_ts = now
+        self._activity_frame += 1
+
+        live, is_live = self._liveStreamText()
+        if live is not None:
+            self._stream_target = live
+        if self._stream_visible is None:
+            self._stream_visible = 0
+        self._stream_visible = self._advanceTypewriter(
+            self._stream_visible,
+            self._stream_target or "",
+            STREAM_ANIM_BASE_CPS,
+            STREAM_ANIM_MAX_CPS,
+            dt,
+        )
+
+        think_live, think_is_live = self._liveThinkText()
+        if think_live is not None:
+            self._think_target = think_live
+        if self._think_visible is None:
+            self._think_visible = 0
+        self._think_visible = self._advanceTypewriter(
+            self._think_visible,
+            self._think_target or "",
+            THINK_ANIM_BASE_CPS,
+            THINK_ANIM_MAX_CPS,
+            dt,
+        )
+
+        should_continue = (
+            is_live
+            or think_is_live
+            or self.shell.busy
+            or self._streamStillAnimating()
+            or self._thinkStillAnimating()
+        )
+        if should_continue:
+            self._renderChatOnly()
+            return
+
+        self._cancel_ns_anim_timer()
+        self._stopStreamAnimation()
         self.run_on_main(self.refreshAll)
+
+    @objc.python_method
+    def _renderChatOnly(self):
+        self.rebuildMessages()
+        if self._follow_output and self.hasUserMessages():
+            self.scrollChatToBottom()
 
     @objc.python_method
     def refreshAll(self):
@@ -799,12 +1077,13 @@ class MacChatUI(NSObject):
         self.slash_panel.setBorderColor_(rgb_color(t["palette_border"]))
         self.session_title_label.setTextColor_(rgb_color(t["text"]))
 
-        for chip in (getattr(self, "model_chip", None), getattr(self, "reasoning_chip", None)):
+        light = name == "light"
+        for chip, popup in (
+            (getattr(self, "model_chip", None), self.model_popup),
+            (getattr(self, "reasoning_chip", None), self.reasoning_popup),
+        ):
             if chip is not None:
-                chip.layer().setBackgroundColor_(rgb_color(t["surface"]).CGColor())
-                chip.layer().setBorderColor_(rgb_color(t["border"]).CGColor())
-        for popup in (self.model_popup, self.reasoning_popup):
-            popup.setContentTintColor_(rgb_color(t["accent"]))
+                style_picker_chip(chip, popup, t, light=light)
         if getattr(self, "clear_all_btn", None) is not None:
             self.clear_all_btn.setContentTintColor_(rgb_color(t["text_muted"]))
 
@@ -1325,12 +1604,17 @@ class MacChatUI(NSObject):
             if effort == current:
                 select = i
         self.reasoning_popup.selectItemAtIndex_(select)
+        t = self.themeColors()
+        style_popup(self.model_popup, t, light=not self.themeIsDark())
+        style_popup(self.reasoning_popup, t, light=not self.themeIsDark())
 
     def modelPopupChanged_(self, sender):
         mid = self.modelIndexToId(self.model_popup.indexOfSelectedItem())
         if mid:
             self.shell._apply_model(mid)
             self.populateReasoningPopup()
+        t = self.themeColors()
+        style_popup(self.model_popup, t, light=not self.themeIsDark())
 
     def reasoningPopupChanged_(self, sender):
         idx = self.model_popup.indexOfSelectedItem()
@@ -1340,6 +1624,8 @@ class MacChatUI(NSObject):
         label = self.reasoning_popup.titleOfSelectedItem()
         if label:
             self.shell._apply_model(mid, reasoning=label)
+        t = self.themeColors()
+        style_popup(self.reasoning_popup, t, light=not self.themeIsDark())
 
     # --- Rendering ---
 
@@ -1409,6 +1695,27 @@ class MacChatUI(NSObject):
             attrs[NSFontAttributeName] = italic_font(13)
             attrs[NSForegroundColorAttributeName] = rgb_color(theme["text_muted"])
             attrs[AppKit.NSParagraphStyleAttributeName] = make_paragraph(line_height=1.3, spacing_after=6, indent=20)
+        elif style == "class:think_pulse":
+            attrs[NSFontAttributeName] = italic_font(13.5)
+            attrs[NSForegroundColorAttributeName] = rgb_color(theme["text_muted"])
+            attrs[AppKit.NSParagraphStyleAttributeName] = make_paragraph(line_height=1.35, spacing_after=4, indent=20)
+        elif style == "class:think_strong":
+            attrs[NSFontAttributeName] = NSFont.systemFontOfSize_weight_(13, AppKit.NSFontWeightSemibold)
+            attrs[NSForegroundColorAttributeName] = rgb_color(theme["text_secondary"])
+            attrs[AppKit.NSParagraphStyleAttributeName] = make_paragraph(line_height=1.3, spacing_after=4, indent=20)
+        elif style == "class:think_em":
+            attrs[NSFontAttributeName] = italic_font(13)
+            attrs[NSForegroundColorAttributeName] = rgb_color(theme["text_muted"])
+            attrs[AppKit.NSParagraphStyleAttributeName] = make_paragraph(line_height=1.3, spacing_after=4, indent=20)
+        elif style == "class:think_h":
+            attrs[NSFontAttributeName] = NSFont.systemFontOfSize_weight_(13.5, AppKit.NSFontWeightSemibold)
+            attrs[NSForegroundColorAttributeName] = rgb_color(theme["accent"])
+            attrs[AppKit.NSParagraphStyleAttributeName] = make_paragraph(line_height=1.3, spacing_after=6, indent=20)
+        elif style == "class:think_code":
+            attrs[NSFontAttributeName] = NSFont.monospacedSystemFontOfSize_weight_(12.5, AppKit.NSFontWeightRegular)
+            attrs[NSForegroundColorAttributeName] = rgb_color(theme["code_text"])
+            attrs[AppKit.NSBackgroundColorAttributeName] = rgb_color(theme["code_bg"])
+            attrs[AppKit.NSParagraphStyleAttributeName] = make_paragraph(line_height=1.25, spacing_after=4, indent=20)
         elif style == "class:spin":
             attrs[NSFontAttributeName] = NSFont.monospacedSystemFontOfSize_weight_(13.5, AppKit.NSFontWeightMedium)
             attrs[NSForegroundColorAttributeName] = rgb_color(theme["accent"])
@@ -1417,6 +1724,9 @@ class MacChatUI(NSObject):
             attrs[NSFontAttributeName] = bold
         elif "code" in style:
             attrs[NSFontAttributeName] = mono
+        elif style == "class:cursor":
+            attrs[NSForegroundColorAttributeName] = rgb_color(theme["accent"])
+            attrs[NSFontAttributeName] = NSFont.systemFontOfSize_weight_(15, AppKit.NSFontWeightMedium)
 
         return attrs
 
@@ -1510,13 +1820,23 @@ class MacChatUI(NSObject):
         has = self.hasUserMessages()
         self.welcome_overlay.setHidden_(has)
 
+        stream_reveal = self._streamReveal() if self._stream_animating else None
+        think_reveal = self._thinkReveal() if self._stream_animating else None
+        activity_frame = self._activity_frame if self._stream_animating else None
+        body_fragments = self.shell.render_body(
+            stream_reveal=stream_reveal,
+            think_reveal=think_reveal,
+            activity_frame=activity_frame,
+            activity_busy=bool(self.shell.busy or self._stream_animating),
+        )
+
         storage = self.chat_view.textStorage()
         storage.beginEditing()
         storage.deleteCharactersInRange_(NSMakeRange(0, storage.length()))
         if has:
             pos = 0
             trailing_nl = 2
-            for style, text in self.shell.render_body():
+            for style, text in body_fragments:
                 if not text:
                     continue
                 attrs = self.attrsForFragment(style, text, theme)
@@ -1958,6 +2278,12 @@ class SettingsController(NSObject):
     window = objc.ivar("window")
     hc_field = objc.ivar("hc_field")
     composio_field = objc.ivar("composio_field")
+    dark_btn = objc.ivar("dark_btn")
+    light_btn = objc.ivar("light_btn")
+    compact_btn = objc.ivar("compact_btn")
+    save_btn = objc.ivar("save_btn")
+    cancel_btn = objc.ivar("cancel_btn")
+    _theme_labels = objc.ivar("_theme_labels")
 
     def initWithShell_ui_(self, shell, ui):
         self = objc.super(SettingsController, self).init()
@@ -1965,8 +2291,33 @@ class SettingsController(NSObject):
             return None
         self.shell = shell
         self.ui = ui
+        self._theme_labels = []
         self.buildSettingsWindow()
         return self
+
+    @objc.python_method
+    def settingsTheme(self):
+        return THEME["dark" if self.shell.theme_name != "light" else "light"]
+
+    @objc.python_method
+    def settingsIsLight(self):
+        return self.shell.theme_name == "light"
+
+    @objc.python_method
+    def applySettingsTheme(self):
+        t = self.settingsTheme()
+        light = self.settingsIsLight()
+        self.window.setBackgroundColor_(rgb_color(t["window"]))
+        content = self.window.contentView()
+        content.layer().setBackgroundColor_(rgb_color(t["window"]).CGColor())
+        for label in self._theme_labels:
+            label.setTextColor_(rgb_color(t["text"]))
+        style_pill_button(self.save_btn, t, accent=True)
+        style_pill_button(self.cancel_btn, t, accent=False)
+        style_pill_button(self.dark_btn, t, accent=not light)
+        style_pill_button(self.light_btn, t, accent=light)
+        appearance_name = "NSAppearanceNameAqua" if light else "NSAppearanceNameDarkAqua"
+        self.window.setAppearance_(AppKit.NSAppearance.appearanceNamed_(appearance_name))
 
     @objc.python_method
     def buildSettingsWindow(self):
@@ -1980,28 +2331,28 @@ class SettingsController(NSObject):
         self.window.setTitle_("Settings")
         self.window.setReleasedWhenClosed_(False)
         self.window.setTitlebarAppearsTransparent_(True)
-        self.window.setBackgroundColor_(rgb_color(THEME["dark"]["window"]))
 
         content = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
         content.setWantsLayer_(True)
-        content.layer().setBackgroundColor_(rgb_color(THEME["dark"]["window"]).CGColor())
 
-        title = make_label("Settings", 22, AppKit.NSFontWeightBold, NSColor.labelColor())
-        hint = make_label("Keys are stored locally at ~/.hackclub-ai/config.json", 12, 0, NSColor.secondaryLabelColor())
+        title = make_label("Settings", 22, AppKit.NSFontWeightBold, None)
+        hint = make_label("Keys are stored locally at ~/.hackclub-ai/config.json", 12, 0, None)
 
-        hc_label = make_label("Hack Club API Key", 13, AppKit.NSFontWeightSemibold, NSColor.labelColor())
+        hc_label = make_label("Hack Club API Key", 13, AppKit.NSFontWeightSemibold, None)
         self.hc_field = NSSecureTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 460, 32))
         self.hc_field.setFont_(NSFont.monospacedSystemFontOfSize_weight_(13, 0))
         self.hc_field.setTranslatesAutoresizingMaskIntoConstraints_(False)
 
-        comp_label = make_label("Composio API Key (optional)", 13, AppKit.NSFontWeightSemibold, NSColor.labelColor())
+        comp_label = make_label("Composio API Key (optional)", 13, AppKit.NSFontWeightSemibold, None)
         self.composio_field = NSSecureTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 460, 32))
         self.composio_field.setFont_(NSFont.monospacedSystemFontOfSize_weight_(13, 0))
         self.composio_field.setTranslatesAutoresizingMaskIntoConstraints_(False)
 
-        appearance_label = make_label("Appearance", 13, AppKit.NSFontWeightSemibold, NSColor.labelColor())
+        appearance_label = make_label("Appearance", 13, AppKit.NSFontWeightSemibold, None)
         dark_btn = make_pill_button(self, "Dark", "settingsThemeDark:", accent=True)
         light_btn = make_pill_button(self, "Light", "settingsThemeLight:", accent=False)
+        self.dark_btn = dark_btn
+        self.light_btn = light_btn
         compact_btn = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 200, 24))
         compact_btn.setButtonType_(AppKit.NSSwitchButton)
         compact_btn.setTitle_("Compact message view")
@@ -2009,11 +2360,13 @@ class SettingsController(NSObject):
         compact_btn.setTarget_(self)
         compact_btn.setAction_("toggleCompactSetting:")
         compact_btn.setTranslatesAutoresizingMaskIntoConstraints_(False)
+        self.compact_btn = compact_btn
 
         save_btn = make_pill_button(self, "Save", "saveSettings:", accent=True)
         cancel_btn = make_pill_button(self, "Cancel", "closeWindow:", accent=False)
         self.save_btn = save_btn
         self.cancel_btn = cancel_btn
+        self._theme_labels = [title, hint, hc_label, comp_label, appearance_label]
 
         for v in (title, hint, hc_label, self.hc_field, comp_label, self.composio_field,
                   appearance_label, dark_btn, light_btn, compact_btn, save_btn, cancel_btn):
@@ -2047,16 +2400,16 @@ class SettingsController(NSObject):
             NSLayoutConstraint.constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant_(save_btn, NSLayoutAttributeCenterY, NSLayoutRelationEqual, cancel_btn, NSLayoutAttributeCenterY, 1, 0),
             NSLayoutConstraint.constraintWithItem_attribute_relatedBy_toItem_attribute_multiplier_constant_(save_btn, NSLayoutAttributeTrailing, NSLayoutRelationEqual, cancel_btn, NSLayoutAttributeLeading, 1, -10),
         ])
-        theme = THEME["dark"]
-        style_pill_button(save_btn, theme, accent=True)
-        style_pill_button(cancel_btn, theme, accent=False)
-        style_pill_button(dark_btn, theme, accent=True)
-        style_pill_button(light_btn, theme, accent=False)
         self.window.setContentView_(content)
+        self.applySettingsTheme()
 
     def showWindow_(self, sender):
         self.hc_field.setStringValue_(load_api_key())
         self.composio_field.setStringValue_(load_composio_key())
+        self.compact_btn.setState_(
+            AppKit.NSControlStateValueOn if self.shell.compact else AppKit.NSControlStateValueOff
+        )
+        self.applySettingsTheme()
         self.window.center()
         self.window.makeKeyAndOrderFront_(None)
 
@@ -2065,23 +2418,46 @@ class SettingsController(NSObject):
 
     def settingsThemeDark_(self, sender):
         self.shell.apply_theme("dark")
-        self.ui.apply_theme("dark")
+        self.applySettingsTheme()
 
     def settingsThemeLight_(self, sender):
         self.shell.apply_theme("light")
-        self.ui.apply_theme("light")
+        self.applySettingsTheme()
 
     def toggleCompactSetting_(self, sender):
         self.shell.compact = sender.state() == AppKit.NSControlStateValueOn
         self.ui._last_render_ver = -1
         self.ui.requestRefresh()
 
+    @objc.python_method
+    def showSettingsAlert_(self, message, informative):
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(message)
+        alert.setInformativeText_(informative)
+        alert.addButtonWithTitle_("OK")
+        alert.runModal()
+
     def saveSettings_(self, sender):
-        hc = self.hc_field.stringValue().strip()
+        hc = self.hc_field.stringValue().strip() or load_api_key()
         if not hc:
+            self.showSettingsAlert_(
+                "API key required",
+                "Enter your Hack Club API key, or cancel to keep your current settings.",
+            )
             return
-        self.shell.update_api_key(hc)
-        self.shell.update_composio_key(self.composio_field.stringValue().strip())
+        try:
+            if self.hc_field.stringValue().strip():
+                self.shell.update_api_key(hc)
+            self.shell.update_composio_key(self.composio_field.stringValue().strip())
+        except ValueError as exc:
+            self.showSettingsAlert_("Could not save settings", str(exc))
+            return
+        save_prefs({
+            "theme": self.shell.theme_name,
+            "compact": self.shell.compact,
+            "model": self.shell.model,
+            "reasoning": self.shell.reasoning_level,
+        })
         self.ui.postOkMessage_("Settings saved")
         self.ui._last_render_ver = -1
         self.ui.requestRefresh()
